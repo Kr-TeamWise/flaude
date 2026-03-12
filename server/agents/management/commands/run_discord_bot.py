@@ -152,12 +152,20 @@ def save_client_to_db(parsed: dict, workspace_id: int | None) -> None:
 
 # Track which thread belongs to which agent: { thread_id: agent_name }
 _thread_agents: dict[str, str] = {}
+# Track threads that already have a session (first message sent)
+_thread_sessions: set[str] = set()
+
+
+def _thread_to_uuid(thread_id: str) -> str:
+    """Convert Discord thread ID (snowflake) to a deterministic UUID."""
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"discord-thread:{thread_id}"))
 
 
 async def run_claude(agent: Agent, prompt: str, session_id: str | None = None, resume: bool = False) -> str:
     """Run claude -p subprocess with agent config.
 
-    session_id: Discord/Slack thread_id를 그대로 사용
+    session_id: UUID (converted from thread_id)
     resume: True면 --resume (후속 질문), False면 --session-id (첫 질문)
     """
     cmd = [
@@ -251,12 +259,14 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
     return chunks
 
 
-async def get_or_create_webhook(channel: discord.TextChannel) -> discord.Webhook:
-    webhooks = await channel.webhooks()
+async def get_or_create_webhook(channel) -> discord.Webhook:
+    """Get or create Flaude webhook. Handles both TextChannel and Thread."""
+    target = channel.parent if isinstance(channel, discord.Thread) else channel
+    webhooks = await target.webhooks()
     for wh in webhooks:
         if wh.name == "Flaude":
             return wh
-    return await channel.create_webhook(name="Flaude")
+    return await target.create_webhook(name="Flaude")
 
 
 _AVATAR_BG = ["F9C4AC", "B8E0D2", "D4C5F9", "F9E2AE", "A8D8EA", "F5B7B1", "C3E8BD", "E8D5B7"]
@@ -273,9 +283,7 @@ def _avatar_url(agent_name: str) -> str:
 
 class FlaudeBot(discord.Client):
     def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.members = True
+        intents = discord.Intents.all()
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -300,53 +308,26 @@ class FlaudeBot(discord.Client):
 
         # ── /ask ─────────────────────────────────────────
         @self.tree.command(name="ask", description="팀 멤버에게 메시지 보내기")
-        @app_commands.describe(member="멤버 또는 팀 선택", message="메시지")
+        @app_commands.describe(member="멤버 또는 팀 선택", message="보낼 메시지")
         @app_commands.autocomplete(member=member_autocomplete)
         async def ask_command(
             interaction: discord.Interaction,
             member: str,
-            message: str = "",
+            message: str,
         ):
-            if not message.strip():
-                parts = member.split(None, 1)
-                if len(parts) == 2:
-                    member, message = parts[0], parts[1]
-                else:
-                    message = member
-                    found = await get_first_active_agent()
-                    if found:
-                        await interaction.response.defer()
-                        initial = await interaction.followup.send(
-                            f"**{found.name}**에게 전달했습니다...", wait=True,
-                        )
-                        thread = await initial.create_thread(name=f"{found.name}: {message[:50]}")
-                        _thread_agents[str(thread.id)] = found.name
-                        result = await run_claude(found, message, session_id=str(thread.id))
-                        webhook = await get_or_create_webhook(interaction.channel)
-                        for chunk in split_message(result):
-                            await webhook.send(
-                                content=chunk, username=found.name,
-                                avatar_url=_avatar_url(found.name), thread=thread,
-                            )
-                        return
-                    await interaction.response.send_message("No active agents.", ephemeral=True)
-                    return
+            member_name = member
 
             # Check if it's a team
-            team = await find_team_by_name(member)
+            team = await find_team_by_name(member_name)
             if team:
                 agents = await get_team_agents(team)
                 if not agents:
-                    await interaction.response.send_message(f"Team '{member}' has no active agents.", ephemeral=True)
+                    await interaction.response.send_message(f"Team '{member_name}' has no active agents.", ephemeral=True)
                     return
 
-                await interaction.response.defer()
-                initial = await interaction.followup.send(
-                    f"**{team.name}** 팀이 작업을 시작합니다...", wait=True,
-                )
-                thread = await initial.create_thread(name=f"{team.name}: {message[:50]}")
+                await interaction.response.send_message(f"**{team.name}** 팀이 작업을 시작합니다...")
                 webhook = await get_or_create_webhook(interaction.channel)
-
+                thread = interaction.channel if isinstance(interaction.channel, discord.Thread) else discord.utils.MISSING
                 results = await run_team(team, agents, message)
                 for r in results:
                     for chunk in split_message(r["result"]):
@@ -359,28 +340,20 @@ class FlaudeBot(discord.Client):
                 return
 
             # Single agent
-            found = await find_agent_by_name(member)
+            found = await find_agent_by_name(member_name)
             if not found:
                 agents = await get_active_agents()
                 names = ", ".join(a.name for a in agents)
                 await interaction.response.send_message(
-                    f"`{member}` not found. Available: {names or 'none'}", ephemeral=True,
+                    f"`{member_name}` not found. Available: {names or 'none'}", ephemeral=True,
                 )
                 return
 
-            await interaction.response.defer()
-
-            # 1. 먼저 스레드 생성 → thread_id 확보
-            initial = await interaction.followup.send(
-                f"**{found.name}**에게 전달했습니다...", wait=True,
+            await interaction.response.send_message(
+                f"**{interaction.user.display_name}**: {message}",
             )
-            thread = await initial.create_thread(name=f"{found.name}: {message[:50]}")
-            thread_id = str(thread.id)
 
-            # thread → agent 매핑 저장 (후속 질문용)
-            _thread_agents[thread_id] = found.name
-
-            # 2. thread_id를 session_id로 사용해서 실행
+            # Try dispatch to user's Mac first
             flaude_user_id = await resolve_discord_user(str(interaction.user.id))
             result = None
             if flaude_user_id:
@@ -388,10 +361,11 @@ class FlaudeBot(discord.Client):
                 result = await dispatch_task(str(flaude_user_id), found.name, message)
 
             if not result:
-                result = await run_claude(found, message, session_id=thread_id)
+                result = await run_claude(found, message)
 
-            # 3. 결과를 스레드에 올림
+            # Reply in same channel/thread
             webhook = await get_or_create_webhook(interaction.channel)
+            thread = interaction.channel if isinstance(interaction.channel, discord.Thread) else discord.utils.MISSING
             for chunk in split_message(result):
                 await webhook.send(
                     content=chunk,
@@ -471,11 +445,19 @@ class FlaudeBot(discord.Client):
                     ephemeral=True,
                 )
 
-        # Sync commands
+        # Sync commands globally + per guild for instant availability
         await self.tree.sync()
-        logger.info("Slash commands synced")
+        logger.info("Slash commands synced (global)")
 
     async def on_ready(self):
+        # Sync to each guild for immediate availability
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                logger.info("Commands synced to guild: %s (%s)", guild.name, guild.id)
+            except Exception as e:
+                logger.warning("Failed to sync to guild %s: %s", guild.name, e)
         logger.info(f"Bot ready: {self.user} (ID: {self.user.id})")
         count = await get_active_agent_count()
         logger.info(f"Active agents: {count}")
@@ -488,15 +470,33 @@ class FlaudeBot(discord.Client):
         if isinstance(message.channel, discord.Thread):
             thread_id = str(message.channel.id)
             agent_name = _thread_agents.get(thread_id)
+
+            # 스레드에 매핑이 없으면, 스레드가 만들어진 원본 메시지(parent)의 작성자로 에이전트 추론
+            if not agent_name:
+                try:
+                    # thread.id == parent message id (스레드가 달린 메시지)
+                    parent_channel = message.channel.parent
+                    starter = await parent_channel.fetch_message(message.channel.id)
+                    if starter.author.bot:
+                        found = await find_agent_by_name(starter.author.display_name)
+                        if found:
+                            agent_name = found.name
+                            _thread_agents[thread_id] = agent_name
+                except Exception as e:
+                    logger.warning("Failed to find agent for thread: %s", e)
+
             if agent_name:
                 agent = await find_agent_by_name(agent_name)
                 if agent:
+                    session_uuid = _thread_to_uuid(thread_id)
+                    is_first = thread_id not in _thread_sessions
                     async with message.channel.typing():
-                        # thread_id를 session_id로 사용, resume=True
                         result = await run_claude(
                             agent, message.content,
-                            session_id=thread_id, resume=True,
+                            session_id=session_uuid, resume=not is_first,
                         )
+                    if is_first:
+                        _thread_sessions.add(thread_id)
                     webhook = await get_or_create_webhook(message.channel.parent)
                     for chunk in split_message(result):
                         await webhook.send(

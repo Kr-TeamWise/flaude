@@ -144,6 +144,12 @@ def save_client_to_db(parsed: dict, workspace_id: int | None) -> None:
 _thread_agents: dict[str, str] = {}
 
 
+def _thread_to_uuid(thread_ts: str) -> str:
+    """Convert Slack thread_ts to a deterministic UUID."""
+    import uuid
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"slack-thread:{thread_ts}"))
+
+
 async def run_claude(agent: Agent, prompt: str, session_id: str | None = None, resume: bool = False) -> str:
     cmd = [
         "claude", "-p", prompt,
@@ -334,7 +340,7 @@ def create_slack_app(token: str) -> AsyncApp:
             result = await dispatch_task(str(flaude_user_id), agent.name, message)
 
         if not result:
-            result = await run_claude(agent, message, session_id=thread_ts)
+            result = await run_claude(agent, message, session_id=_thread_to_uuid(thread_ts))
 
         # 3. 결과를 스레드에 올림
         blocks = format_agent_response(agent.name, agent.role, result)
@@ -462,7 +468,7 @@ def create_slack_app(token: str) -> AsyncApp:
             agent_name = _thread_agents[thread_ts]
             agent = await find_agent_by_name(agent_name)
             if agent:
-                result = await run_claude(agent, user_text, session_id=thread_ts, resume=True)
+                result = await run_claude(agent, user_text, session_id=_thread_to_uuid(thread_ts), resume=True)
                 blocks = format_agent_response(agent.name, agent.role, result)
                 await client.chat_postMessage(
                     channel=channel_id,
