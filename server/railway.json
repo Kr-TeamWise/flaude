@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python manage.py migrate --noinput && python manage.py collectstatic --noinput && daphne -b 0.0.0.0 -p $PORT server.asgi:application",
+    "startCommand": "python manage.py migrate --noinput && python manage.py collectstatic --noinput && python manage.py run_discord_bot & python manage.py run_slack_bot & python manage.py run_scheduler & daphne -b 0.0.0.0 -p $PORT server.asgi:application",
     "healthcheckPath": "/api/health",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3

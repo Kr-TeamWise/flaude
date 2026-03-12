@@ -754,3 +754,38 @@ export const BUILT_IN_TOOLS = [
   "Glob",
   "Grep",
 ];
+
+// ── Friendly tool names for non-technical users ─────
+export const TOOL_DISPLAY: Record<string, { ko: string; en: string }> = {
+  WebSearch: { ko: "인터넷 검색", en: "Web Search" },
+  WebFetch: { ko: "웹페이지 읽기", en: "Read Web Pages" },
+  Bash: { ko: "프로그램 실행", en: "Run Programs" },
+  Read: { ko: "파일 읽기", en: "Read Files" },
+  Write: { ko: "파일 쓰기", en: "Write Files" },
+  Edit: { ko: "파일 수정", en: "Edit Files" },
+  Glob: { ko: "파일 찾기", en: "Find Files" },
+  Grep: { ko: "내용 검색", en: "Search Content" },
+  mcp__slack: { ko: "Slack 연동", en: "Slack" },
+  mcp__discord: { ko: "Discord 연동", en: "Discord" },
+  mcp__github: { ko: "GitHub 연동", en: "GitHub" },
+};
+
+export function toolLabel(id: string, lang: "ko" | "en"): string {
+  return TOOL_DISPLAY[id]?.[lang] ?? id;
+}
+
+// ── Schedule presets for non-technical users ─────────
+export const SCHEDULE_PRESETS: { cron: string; ko: string; en: string }[] = [
+  { cron: "0 9 * * 1-5", ko: "평일 오전 9시", en: "Weekdays at 9am" },
+  { cron: "0 9 * * *", ko: "매일 오전 9시", en: "Every day at 9am" },
+  { cron: "0 9 * * 1", ko: "매주 월요일 오전 9시", en: "Every Monday at 9am" },
+  { cron: "0 18 * * 1-5", ko: "평일 오후 6시", en: "Weekdays at 6pm" },
+  { cron: "0 */3 * * *", ko: "3시간마다", en: "Every 3 hours" },
+  { cron: "0 */6 * * *", ko: "6시간마다", en: "Every 6 hours" },
+  { cron: "0 */12 * * *", ko: "12시간마다", en: "Every 12 hours" },
+];
+
+export function cronLabel(cron: string, lang: "ko" | "en"): string {
+  const preset = SCHEDULE_PRESETS.find((p) => p.cron === cron);
+  return preset ? preset[lang] : cron;
+}

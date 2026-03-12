@@ -13,9 +13,9 @@ const translations = {
   "member.edit": { ko: "팀원 수정", en: "Edit Member" },
   "member.name": { ko: "이름", en: "Name" },
   "member.role": { ko: "역할", en: "Role" },
-  "member.instructions": { ko: "지시사항", en: "Instructions" },
-  "member.tools": { ko: "사용 도구", en: "Allowed Tools" },
-  "member.notAllowed": { ko: "금지 도구", en: "Disallowed Tools" },
+  "member.instructions": { ko: "업무 매뉴얼", en: "Work Manual" },
+  "member.tools": { ko: "할 수 있는 일", en: "Capabilities" },
+  "member.notAllowed": { ko: "금지된 일", en: "Restrictions" },
   "member.skills": { ko: "스킬", en: "Skills" },
   "member.fire": { ko: "해고", en: "Fire" },
   "member.rehire": { ko: "복직", en: "Rehire" },
@@ -52,7 +52,7 @@ const translations = {
 
   // Clients
   "client.title": { ko: "고객관리", en: "Clients" },
-  "client.create": { ko: "클라이언트 추가", en: "New Client" },
+  "client.create": { ko: "고객 추가", en: "New Client" },
   "client.company": { ko: "회사", en: "Company" },
   "client.contact": { ko: "담당자", en: "Contact" },
   "client.email": { ko: "이메일", en: "Email" },
@@ -137,9 +137,9 @@ const translations = {
   "hire.hire": { ko: "채용", en: "Hire" },
   "hire.skillBrowserShow": { ko: "스킬 라이브러리 보기", en: "Browse Skill Library" },
   "hire.skillBrowserHide": { ko: "스킬 닫기", en: "Hide Skills" },
-  "hire.aiPlaceholder": { ko: "어떤 팀원을 만들까요? (예: 블로그 글을 써주는 팀원)", en: "Describe the member (e.g. writes blog posts)" },
+  "hire.aiPlaceholder": { ko: "어떤 일을 시키고 싶으세요? (예: 블로그 글을 써주는 팀원)", en: "What should this member do? (e.g. writes blog posts)" },
   "hire.aiHint": { ko: "이름/역할 + 설명을 입력하면 AI가 지시사항을 작성합니다.", en: "Enter name/role + description and AI will write the instructions." },
-  "hire.instructionPlaceholder": { ko: "직접 작성하거나, AI로 자동 생성하세요.", en: "Write manually or generate with AI." },
+  "hire.instructionPlaceholder": { ko: "이 팀원이 어떻게 일해야 하는지 적어주세요. 위에서 AI가 자동 작성해줄 수도 있어요!", en: "Describe how this member should work. You can also auto-generate above!" },
   "hire.channelHint": { ko: "채널 ID, 쉼표로 구분", en: "Channel IDs, comma-separated" },
   "hire.channelPlaceholder": { ko: "예: 1234567890, 9876543210", en: "e.g. 1234567890, 9876543210" },
 

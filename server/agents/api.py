@@ -13,9 +13,10 @@ from ninja.security import HttpBasicAuth, HttpBearer
 from typing import List, Optional
 
 from .models import (
-    Agent, AgentTeam, AuthToken, Client, ClientHistory,
-    ExecutionLog, Staff, UserPlatformLink, Workspace, WorkspaceInvite,
-    WorkspaceMembership,
+    Agent, AgentMemory, AgentSchedule, AgentTeam, ApprovalRequest,
+    AuthToken, Client, ClientHistory, ExecutionLog, Staff, TeamMemory,
+    UserPlatformLink, Workspace, WorkspaceInvite, WorkspaceMembership,
+    STATUS_PIPELINE,
 )
 
 logger = logging.getLogger("flaude.api")
@@ -876,6 +877,278 @@ def parse_client_info(request, ws_id: int, raw_text: str):
         logger.warning("Claude CLI parsing failed: %s", e)
 
     return {"parsed": _fallback_parse(raw_text)}
+
+
+# ── Agent Memory ────────────────────────────────────────────
+
+
+class AgentMemoryIn(Schema):
+    key: str
+    content: str
+
+
+class AgentMemoryOut(Schema):
+    id: int
+    key: str
+    content: str
+    source: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@api.get("/agents/{agent_id}/memories", response=List[AgentMemoryOut])
+def list_agent_memories(request, agent_id: int):
+    agent = get_object_or_404(Agent, id=agent_id)
+    _get_workspace(agent.workspace_id, request.auth)
+    return list(AgentMemory.objects.filter(agent=agent).order_by("-updated_at"))
+
+
+@api.post("/agents/{agent_id}/memories", response=AgentMemoryOut)
+def create_agent_memory(request, agent_id: int, payload: AgentMemoryIn):
+    agent = get_object_or_404(Agent, id=agent_id)
+    _get_workspace(agent.workspace_id, request.auth)
+    mem, _ = AgentMemory.objects.update_or_create(
+        agent=agent, key=payload.key,
+        defaults={"content": payload.content, "source": "manual"},
+    )
+    return mem
+
+
+@api.delete("/memories/{memory_id}", response={204: None})
+def delete_agent_memory(request, memory_id: int):
+    mem = get_object_or_404(AgentMemory, id=memory_id)
+    _get_workspace(mem.agent.workspace_id, request.auth)
+    mem.delete()
+    return 204, None
+
+
+# ── Team Memory ─────────────────────────────────────────────
+
+
+class TeamMemoryIn(Schema):
+    key: str
+    content: str
+
+
+class TeamMemoryOut(Schema):
+    id: int
+    key: str
+    content: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@api.get("/agent-teams/{team_id}/memories", response=List[TeamMemoryOut])
+def list_team_memories(request, team_id: int):
+    team = get_object_or_404(AgentTeam, id=team_id)
+    _get_workspace(team.workspace_id, request.auth)
+    return list(TeamMemory.objects.filter(team=team).order_by("-updated_at"))
+
+
+@api.post("/agent-teams/{team_id}/memories", response=TeamMemoryOut)
+def create_team_memory(request, team_id: int, payload: TeamMemoryIn):
+    team = get_object_or_404(AgentTeam, id=team_id)
+    _get_workspace(team.workspace_id, request.auth)
+    mem, _ = TeamMemory.objects.update_or_create(
+        team=team, key=payload.key,
+        defaults={"content": payload.content},
+    )
+    return mem
+
+
+@api.delete("/team-memories/{memory_id}", response={204: None})
+def delete_team_memory(request, memory_id: int):
+    mem = get_object_or_404(TeamMemory, id=memory_id)
+    _get_workspace(mem.team.workspace_id, request.auth)
+    mem.delete()
+    return 204, None
+
+
+# ── Client Run & Timeline ──────────────────────────────────
+
+
+class ClientRunIn(Schema):
+    prompt: str = ""
+    auto_advance: bool = True
+
+
+class TimelineEntry(Schema):
+    id: int
+    type: str  # "history" | "execution"
+    agent_name: str
+    action: str
+    detail: str
+    created_at: datetime
+
+
+@api.get("/clients/{client_id}/timeline", response=List[TimelineEntry])
+def client_timeline(request, client_id: int):
+    """Unified timeline: ClientHistory + ExecutionLog for this client."""
+    client = get_object_or_404(Client, id=client_id)
+    _get_workspace(client.workspace_id, request.auth)
+
+    entries = []
+    for h in ClientHistory.objects.filter(client=client).order_by("-created_at")[:50]:
+        entries.append({
+            "id": h.id,
+            "type": "history",
+            "agent_name": h.agent_name,
+            "action": h.action,
+            "detail": h.detail,
+            "created_at": h.created_at,
+        })
+    for e in ExecutionLog.objects.filter(client=client, status__in=["completed", "failed"]).select_related("agent").order_by("-created_at")[:50]:
+        entries.append({
+            "id": e.id + 100000,  # offset to avoid ID collision
+            "type": "execution",
+            "agent_name": e.agent.name,
+            "action": f"실행 ({e.status})",
+            "detail": e.result[:300] if e.result else "",
+            "created_at": e.created_at,
+        })
+    entries.sort(key=lambda x: x["created_at"], reverse=True)
+    return entries[:50]
+
+
+class BatchRunIn(Schema):
+    client_ids: list
+    agent_name: str = ""
+    prompt: str = ""
+
+
+@api.post("/workspaces/{ws_id}/clients/batch-run")
+def batch_run_clients(request, ws_id: int, payload: BatchRunIn):
+    """Queue batch run of an agent on multiple clients. Returns immediately."""
+    ws = _get_workspace(ws_id, request.auth)
+    count = 0
+    for cid in payload.client_ids:
+        try:
+            client = Client.objects.get(id=cid, workspace=ws)
+            agent_name = payload.agent_name or client.assigned_agent
+            if agent_name:
+                count += 1
+        except Client.DoesNotExist:
+            continue
+    return {"queued": count, "message": f"{count}건의 작업이 대기열에 추가되었습니다."}
+
+
+# ── Schedules ───────────────────────────────────────────────
+
+
+class ScheduleIn(Schema):
+    name: str
+    agent_id: Optional[int] = None
+    team_id: Optional[int] = None
+    cron_expression: str
+    prompt: str
+    client_id: Optional[int] = None
+    notification_channel: str = ""
+    is_active: bool = True
+
+
+class ScheduleOut(Schema):
+    id: int
+    name: str
+    agent_id: Optional[int] = None
+    team_id: Optional[int] = None
+    cron_expression: str
+    prompt: str
+    client_id: Optional[int] = None
+    notification_channel: str
+    is_active: bool
+    last_run_at: Optional[datetime] = None
+    created_at: datetime
+
+
+@api.get("/workspaces/{ws_id}/schedules", response=List[ScheduleOut])
+def list_schedules(request, ws_id: int):
+    ws = _get_workspace(ws_id, request.auth)
+    return list(AgentSchedule.objects.filter(workspace=ws).order_by("-created_at"))
+
+
+@api.post("/workspaces/{ws_id}/schedules", response=ScheduleOut)
+def create_schedule(request, ws_id: int, payload: ScheduleIn):
+    ws = _get_workspace(ws_id, request.auth)
+    sched = AgentSchedule.objects.create(
+        workspace=ws,
+        name=payload.name,
+        agent_id=payload.agent_id,
+        team_id=payload.team_id,
+        cron_expression=payload.cron_expression,
+        prompt=payload.prompt,
+        client_id=payload.client_id,
+        notification_channel=payload.notification_channel,
+        is_active=payload.is_active,
+    )
+    return sched
+
+
+@api.put("/schedules/{schedule_id}", response=ScheduleOut)
+def update_schedule(request, schedule_id: int, payload: ScheduleIn):
+    sched = get_object_or_404(AgentSchedule, id=schedule_id)
+    _get_workspace(sched.workspace_id, request.auth)
+    for attr, value in payload.dict().items():
+        setattr(sched, attr, value)
+    sched.save()
+    return sched
+
+
+@api.delete("/schedules/{schedule_id}", response={204: None})
+def delete_schedule(request, schedule_id: int):
+    sched = get_object_or_404(AgentSchedule, id=schedule_id)
+    _get_workspace(sched.workspace_id, request.auth)
+    sched.delete()
+    return 204, None
+
+
+# ── Approvals ───────────────────────────────────────────────
+
+
+class ApprovalOut(Schema):
+    id: int
+    team_name: str
+    agent_name: str
+    next_agent_name: str
+    result_preview: str
+    prompt: str
+    status: str
+    platform: str
+    created_at: datetime
+    decided_at: Optional[datetime] = None
+
+
+class ApprovalDecisionIn(Schema):
+    decision: str  # "approved" or "rejected"
+
+
+@api.get("/approvals/pending", response=List[ApprovalOut])
+def list_pending_approvals(request):
+    qs = ApprovalRequest.objects.filter(status="pending").select_related("team", "agent", "next_agent")
+    return [
+        {
+            "id": a.id,
+            "team_name": a.team.name,
+            "agent_name": a.agent.name,
+            "next_agent_name": a.next_agent.name,
+            "result_preview": a.result_so_far[:300],
+            "prompt": a.prompt[:200],
+            "status": a.status,
+            "platform": a.platform,
+            "created_at": a.created_at,
+            "decided_at": a.decided_at,
+        }
+        for a in qs.order_by("-created_at")[:20]
+    ]
+
+
+@api.post("/approvals/{approval_id}/decide")
+def decide_approval_api(request, approval_id: int, payload: ApprovalDecisionIn):
+    approval = get_object_or_404(ApprovalRequest, id=approval_id, status="pending")
+    approval.status = payload.decision
+    approval.decided_by = request.auth.email if hasattr(request.auth, 'email') else str(request.auth)
+    approval.decided_at = timezone.now()
+    approval.save(update_fields=["status", "decided_by", "decided_at"])
+    return {"ok": True, "status": approval.status}
 
 
 def _fallback_parse(raw_text: str) -> dict:

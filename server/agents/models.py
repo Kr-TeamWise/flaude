@@ -97,6 +97,7 @@ class Client(models.Model):
         ("meeting", "Meeting"), ("closed", "Closed"),
     ])
     assigned_agent = models.CharField(max_length=50, blank=True)
+    notification_channel = models.CharField(max_length=100, blank=True)  # Discord/Slack channel for updates
     created_by = models.ForeignKey(User, on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -113,8 +114,41 @@ class ClientHistory(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
+class AgentMemory(models.Model):
+    """Persistent per-agent knowledge entries that survive across sessions."""
+    agent = models.ForeignKey(Agent, on_delete=models.CASCADE, related_name="memories")
+    key = models.CharField(max_length=200)
+    content = models.TextField()
+    source = models.CharField(max_length=50, default="manual")  # manual, auto, execution
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("agent", "key")
+
+    def __str__(self):
+        return f"{self.agent.name}: {self.key}"
+
+
+class TeamMemory(models.Model):
+    """Shared knowledge for a team, accessible by all members."""
+    team = models.ForeignKey(AgentTeam, on_delete=models.CASCADE, related_name="memories")
+    key = models.CharField(max_length=200)
+    content = models.TextField()
+    created_by_agent = models.ForeignKey(Agent, null=True, blank=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("team", "key")
+
+    def __str__(self):
+        return f"{self.team.name}: {self.key}"
+
+
 class ExecutionLog(models.Model):
     agent = models.ForeignKey(Agent, on_delete=models.CASCADE, related_name="executions")
+    client = models.ForeignKey('Client', null=True, blank=True, on_delete=models.SET_NULL, related_name="executions")
     platform = models.CharField(max_length=20, default="app")
     prompt = models.TextField()
     result = models.TextField(blank=True)
@@ -123,6 +157,7 @@ class ExecutionLog(models.Model):
     ])
     duration_ms = models.IntegerField(null=True, blank=True)
     session_id = models.CharField(max_length=100, blank=True)
+    team_run_id = models.CharField(max_length=100, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 
@@ -155,6 +190,50 @@ class AuthToken(models.Model):
         return f"Token for {self.user.username}"
 
 
+STATUS_PIPELINE = ["new", "researching", "contacted", "meeting", "closed"]
+
+
+class AgentSchedule(models.Model):
+    """Cron-based scheduled execution of agents or teams."""
+    workspace = models.ForeignKey(Workspace, on_delete=models.CASCADE, related_name="schedules")
+    agent = models.ForeignKey(Agent, null=True, blank=True, on_delete=models.CASCADE, related_name="schedules")
+    team = models.ForeignKey(AgentTeam, null=True, blank=True, on_delete=models.CASCADE, related_name="schedules")
+    name = models.CharField(max_length=200)
+    cron_expression = models.CharField(max_length=100)  # e.g. "0 9 * * 1-5"
+    prompt = models.TextField()
+    client = models.ForeignKey(Client, null=True, blank=True, on_delete=models.SET_NULL)
+    notification_channel = models.CharField(max_length=100, blank=True)  # Discord/Slack channel for results
+    is_active = models.BooleanField(default=True)
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        target = self.agent.name if self.agent else (self.team.name if self.team else "?")
+        return f"Schedule: {self.name} ({target}) [{self.cron_expression}]"
+
+
+class ApprovalRequest(models.Model):
+    """Human-in-the-loop approval for team workflows."""
+    team_run_id = models.CharField(max_length=100)
+    team = models.ForeignKey(AgentTeam, on_delete=models.CASCADE, related_name="approvals")
+    agent = models.ForeignKey(Agent, on_delete=models.CASCADE, related_name="+")  # produced result
+    next_agent = models.ForeignKey(Agent, on_delete=models.CASCADE, related_name="+")  # waiting
+    result_so_far = models.TextField()
+    prompt = models.TextField()
+    platform = models.CharField(max_length=20)
+    platform_channel_id = models.CharField(max_length=100, blank=True)
+    platform_message_id = models.CharField(max_length=100, blank=True)
+    status = models.CharField(max_length=20, default="pending", choices=[
+        ("pending", "Pending"), ("approved", "Approved"), ("rejected", "Rejected"),
+    ])
+    decided_by = models.CharField(max_length=100, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Approval: {self.team.name} [{self.status}]"
+
+
 class UserPlatformLink(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="platform_links")
     platform = models.CharField(max_length=20)
@@ -164,3 +243,16 @@ class UserPlatformLink(models.Model):
 
     class Meta:
         unique_together = ("platform", "platform_user_id")
+
+
+class ThreadMessage(models.Model):
+    """Persisted chat history for Discord/Slack threads."""
+    platform = models.CharField(max_length=20)  # "discord" or "slack"
+    thread_id = models.CharField(max_length=100, db_index=True)
+    agent_name = models.CharField(max_length=100)
+    role = models.CharField(max_length=10)  # "user" or "agent"
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]

@@ -9,12 +9,10 @@ Requires:
     - SLACK_APP_TOKEN env var (for Socket Mode)
 
 Features:
-    1. /ask <member> <message> — Execute agent or team
-    2. /agents — List active agents
-    3. /client <info> — Auto-parse and register client
-    4. /link <token> — Link Slack account to Flaude
-    5. Team execution — Sequential/parallel orchestration
-    6. Channel-based routing
+    - @agent_name message — Natural message routing
+    - Thread-based session continuity
+    - /agents, /teams, /status, /history, /client, /link, /help
+    - /approve, /reject, /approvals, /schedule
 """
 
 import asyncio
@@ -27,7 +25,12 @@ from asgiref.sync import sync_to_async
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
-from agents.models import Agent, AgentTeam, Client, UserPlatformLink
+from agents.models import Agent, AgentTeam, Client, UserPlatformLink, ThreadMessage
+from agents.orchestrator import (
+    run_claude, run_team, get_team_agents_with_meta,
+    get_running_executions, get_execution_history,
+    get_pending_approvals, decide_approval, resume_after_approval,
+)
 
 logger = logging.getLogger("flaude.slack")
 
@@ -65,15 +68,8 @@ def find_team_by_name(name: str) -> AgentTeam | None:
 
 
 @sync_to_async
-def get_team_agents(team: AgentTeam) -> list[Agent]:
-    sorted_members = sorted(team.members, key=lambda m: m.get("order", 0))
-    agents = []
-    for m in sorted_members:
-        try:
-            agents.append(Agent.objects.get(id=m["agent_id"], status="active"))
-        except Agent.DoesNotExist:
-            continue
-    return agents
+def get_all_teams():
+    return list(AgentTeam.objects.all())
 
 
 @sync_to_async
@@ -88,7 +84,6 @@ def resolve_slack_user(slack_user_id: str) -> int | None:
 
 
 async def parse_client_text(raw_text: str) -> dict:
-    """Parse client info using claude CLI (haiku model)."""
     import json as json_mod
     from agents.api import _fallback_parse
 
@@ -138,85 +133,71 @@ def save_client_to_db(parsed: dict, workspace_id: int | None) -> None:
         )
 
 
-# ── Claude subprocess runner ─────────────────────────────────
+# ── Session tracking ─────────────────────────────────────────
 
-# Track which thread belongs to which agent: { thread_ts: agent_name }
 _thread_agents: dict[str, str] = {}
 
 
-def _thread_to_uuid(thread_ts: str) -> str:
-    """Convert Slack thread_ts to a deterministic UUID."""
-    import uuid
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"slack-thread:{thread_ts}"))
-
-
-async def run_claude(agent: Agent, prompt: str, session_id: str | None = None, resume: bool = False) -> str:
-    cmd = [
-        "claude", "-p", prompt,
-        "--model", "opus",
-        "--system-prompt", agent.instructions,
-        "--permission-mode", "bypassPermissions",
-    ]
-
-    if agent.tools:
-        cmd += ["--allowedTools", ",".join(agent.tools)]
-    if agent.not_allowed:
-        cmd += ["--disallowedTools", ",".join(agent.not_allowed)]
-
-    if session_id:
-        if resume:
-            cmd += ["--resume", session_id]
-        else:
-            cmd += ["--session-id", session_id]
-
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
+@sync_to_async
+def _save_thread_msg(platform: str, thread_id: str, agent_name: str, role: str, content: str):
+    ThreadMessage.objects.create(
+        platform=platform, thread_id=thread_id,
+        agent_name=agent_name, role=role, content=content[:1000],
     )
-    stdout, stderr = await proc.communicate()
-
-    if proc.returncode != 0:
-        err = stderr.decode().strip()
-        return f"Error: {err[:500]}"
-
-    return stdout.decode().strip()
-
-
-# ── Team Orchestrator ────────────────────────────────────────
+    # Keep only last 20 per thread
+    ids = list(
+        ThreadMessage.objects.filter(platform=platform, thread_id=thread_id)
+        .order_by("-created_at").values_list("id", flat=True)[20:]
+    )
+    if ids:
+        ThreadMessage.objects.filter(id__in=ids).delete()
 
 
-async def run_team(team: AgentTeam, agents: list[Agent], prompt: str) -> list[dict]:
-    results = []
+@sync_to_async
+def _get_thread_history(platform: str, thread_id: str) -> list[dict]:
+    msgs = ThreadMessage.objects.filter(
+        platform=platform, thread_id=thread_id
+    ).order_by("created_at")[:20]
+    return [{"role": m.role, "text": m.content} for m in msgs]
 
-    if team.execution_mode == "parallel":
-        tasks = [run_claude(agent, prompt) for agent in agents]
-        outputs = await asyncio.gather(*tasks, return_exceptions=True)
-        for agent, output in zip(agents, outputs):
-            if isinstance(output, Exception):
-                results.append({"agent_name": agent.name, "result": f"Error: {output}"})
-            else:
-                results.append({"agent_name": agent.name, "result": output})
-    else:
-        accumulated_context = ""
-        for i, agent in enumerate(agents):
-            if i == 0:
-                full_prompt = prompt
-            else:
-                full_prompt = (
-                    f"이전 에이전트({agents[i-1].name})의 결과:\n"
-                    f"---\n{accumulated_context}\n---\n\n"
-                    f"사용자 요청: {prompt}"
-                )
-            result = await run_claude(agent, full_prompt)
-            results.append({"agent_name": agent.name, "result": result})
-            accumulated_context = result
 
-    return results
+@sync_to_async
+def _get_thread_agent(platform: str, thread_id: str) -> str | None:
+    last = ThreadMessage.objects.filter(
+        platform=platform, thread_id=thread_id, role="agent"
+    ).order_by("-created_at").first()
+    return last.agent_name if last else None
+
+
+async def _build_thread_prompt(platform: str, thread_id: str, new_message: str) -> str:
+    history = await _get_thread_history(platform, thread_id)
+    if not history:
+        return new_message
+    lines = ["[이전 대화]"]
+    for h in history:
+        prefix = "사용자" if h["role"] == "user" else "에이전트"
+        lines.append(f"{prefix}: {h['text']}")
+    lines.append(f"\n[새 메시지]\n{new_message}")
+    return "\n".join(lines)
+
+
+async def _fetch_slack_channel_context(slack_client, channel_id: str, limit: int = 15) -> str:
+    """Fetch recent messages from Slack channel as context."""
+    try:
+        resp = await slack_client.conversations_history(channel=channel_id, limit=limit)
+        messages = []
+        for msg in reversed(resp.get("messages", [])):
+            text = msg.get("text", "").strip()
+            if not text or text.startswith("/"):
+                continue
+            user = msg.get("user", "someone")
+            messages.append(f"{user}: {text[:300]}")
+        if not messages:
+            return ""
+        return "[채널 최근 메시지]\n" + "\n".join(messages) + "\n\n"
+    except Exception as e:
+        logger.warning("Failed to fetch channel context: %s", e)
+        return ""
 
 
 # ── Block Kit helpers ────────────────────────────────────────
@@ -254,203 +235,247 @@ def _split_text(text: str, limit: int = 3000) -> list[str]:
 def create_slack_app(token: str) -> AsyncApp:
     app = AsyncApp(token=token)
 
-    # ── /ask <member> <message> ──────────────────────────
-    @app.command("/ask")
-    async def handle_ask(ack, command, client):
-        await ack()
-
-        raw_text = (command.get("text") or "").strip()
-        if not raw_text:
-            await client.chat_postEphemeral(
-                channel=command["channel_id"],
-                user=command["user_id"],
-                text="Usage: `/ask <member> <message>`\nExample: `/ask 수현 삼성SDS 조사해줘`",
-            )
-            return
-
-        parts = raw_text.split(None, 1)
-        member_name = parts[0]
-        message = parts[1] if len(parts) > 1 else ""
-
-        if not message:
-            await client.chat_postEphemeral(
-                channel=command["channel_id"],
-                user=command["user_id"],
-                text="메시지를 입력해주세요. Example: `/ask 수현 삼성SDS 조사해줘`",
-            )
-            return
-
-        # Check if it's a team
-        team = await find_team_by_name(member_name)
-        if team:
-            agents = await get_team_agents(team)
-            if not agents:
-                await client.chat_postEphemeral(
-                    channel=command["channel_id"],
-                    user=command["user_id"],
-                    text=f"Team '{member_name}' has no active agents.",
-                )
-                return
-
-            initial = await client.chat_postMessage(
-                channel=command["channel_id"],
-                text=f"*{team.name}* 팀이 작업을 시작합니다...",
-            )
-
-            results = await run_team(team, agents, message)
-            for r in results:
-                agent_obj = await find_agent_by_name(r["agent_name"])
-                role = agent_obj.role if agent_obj else ""
-                blocks = format_agent_response(r["agent_name"], role, r["result"])
-                await client.chat_postMessage(
-                    channel=command["channel_id"],
-                    thread_ts=initial["ts"],
-                    blocks=blocks,
-                    text=f"[{r['agent_name']}]\n{r['result']}",
-                )
-            return
-
-        # Single agent
-        agent = await find_agent_by_name(member_name)
-        if not agent:
-            agents = await get_active_agents()
-            names = ", ".join(a.name for a in agents)
-            await client.chat_postEphemeral(
-                channel=command["channel_id"],
-                user=command["user_id"],
-                text=f"`{member_name}` not found. Available: {names or 'none'}",
-            )
-            return
-
-        # 1. 먼저 초기 메시지 → thread_ts 확보
-        initial = await client.chat_postMessage(
-            channel=command["channel_id"],
-            text=f"*{agent.name}*에게 전달했습니다...",
-        )
-        thread_ts = initial["ts"]
-
-        # thread_ts → agent 매핑 저장 (후속 질문용)
-        _thread_agents[thread_ts] = agent.name
-
-        # 2. thread_ts를 session_id로 사용해서 실행
-        flaude_user_id = await resolve_slack_user(command["user_id"])
-        result = None
-        if flaude_user_id:
-            from agents.dispatch import dispatch_task
-            result = await dispatch_task(str(flaude_user_id), agent.name, message)
-
-        if not result:
-            result = await run_claude(agent, message, session_id=_thread_to_uuid(thread_ts))
-
-        # 3. 결과를 스레드에 올림
-        blocks = format_agent_response(agent.name, agent.role, result)
-        await client.chat_postMessage(
-            channel=command["channel_id"],
-            thread_ts=thread_ts,
-            blocks=blocks,
-            text=f"[{agent.name} · {agent.role}]\n{result}",
-        )
-
     # ── /agents ──────────────────────────────────────────
     @app.command("/agents")
     async def handle_agents(ack, command, client):
         await ack()
         agents = await get_active_agents()
         if not agents:
-            await client.chat_postEphemeral(
-                channel=command["channel_id"],
-                user=command["user_id"],
-                text="No active agents.",
-            )
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="No active agents.")
+            return
+        lines = [f"*{a.name}* — {a.role}" for a in agents]
+        await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="\n".join(lines))
+
+    # ── /teams ───────────────────────────────────────────
+    @app.command("/teams")
+    async def handle_teams(ack, command, client):
+        await ack()
+        teams = await get_all_teams()
+        if not teams:
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="No teams configured.")
             return
         lines = []
-        for a in agents:
-            ch_list = ", ".join(f"<#{c}>" for c in (a.channels or []))
-            line = f"*{a.name}* — {a.role}"
-            if ch_list:
-                line += f" ({ch_list})"
-            lines.append(line)
-        await client.chat_postEphemeral(
-            channel=command["channel_id"],
-            user=command["user_id"],
-            text="\n".join(lines),
-        )
+        for t in teams:
+            member_count = len(t.members or [])
+            has_lead = any(m.get("is_lead") for m in (t.members or []))
+            lead_str = " (has lead)" if has_lead else ""
+            lines.append(f"*{t.name}* — {t.execution_mode}, {member_count} members{lead_str}")
+        await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="\n".join(lines))
+
+    # ── /status ──────────────────────────────────────────
+    @app.command("/status")
+    async def handle_status(ack, command, client):
+        await ack()
+        agent_filter = (command.get("text") or "").strip() or None
+        running = await get_running_executions(agent_filter)
+        if not running:
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="현재 실행 중인 작업이 없습니다.")
+            return
+        lines = [f"🔄 *{r['agent_name']}* — `{r['prompt']}` ({r['elapsed_seconds']}s, {r['platform']})" for r in running]
+        await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="\n".join(lines))
+
+    # ── /history ─────────────────────────────────────────
+    @app.command("/history")
+    async def handle_history(ack, command, client):
+        await ack()
+        agent_filter = (command.get("text") or "").strip() or None
+        history = await get_execution_history(agent_filter, 10)
+        if not history:
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="실행 이력이 없습니다.")
+            return
+        lines = []
+        for h in history:
+            icon = "✅" if h["status"] == "completed" else "❌"
+            duration = f"{h['duration_ms']}ms" if h["duration_ms"] else "?"
+            lines.append(f"{icon} *{h['agent_name']}* — `{h['prompt']}` ({duration}, {h['platform']})")
+        await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="\n".join(lines))
 
     # ── /client ──────────────────────────────────────────
     @app.command("/client")
     async def handle_client(ack, command, client):
         await ack()
-
         raw_text = (command.get("text") or "").strip()
         if not raw_text:
-            await client.chat_postEphemeral(
-                channel=command["channel_id"],
-                user=command["user_id"],
-                text="Usage: `/client 삼성SDS 김부장 kim@samsung.com 010-1234-5678`",
-            )
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="Usage: `/client 삼성SDS 김부장 kim@samsung.com`")
             return
 
         from agents.models import Workspace
         ws = await sync_to_async(Workspace.objects.first)()
         ws_id = ws.id if ws else None
-
         parsed = await parse_client_text(raw_text)
         await save_client_to_db(parsed, ws_id)
 
         name = parsed.get("contact_name", "")
         company = parsed.get("company", "")
         display = f"{company} {name}".strip() or raw_text
-
         import json
         formatted = json.dumps({k: v for k, v in parsed.items() if v}, ensure_ascii=False, indent=2)
-
-        await client.chat_postMessage(
-            channel=command["channel_id"],
-            text=f"*{display}* 등록했습니다.\n```{formatted}```",
-        )
+        await client.chat_postMessage(channel=command["channel_id"], text=f"*{display}* 등록했습니다.\n```{formatted}```")
 
     # ── /link ────────────────────────────────────────────
     @app.command("/link")
     async def handle_link(ack, command, client):
         await ack()
-
         token = (command.get("text") or "").strip()
         if not token:
-            await client.chat_postEphemeral(
-                channel=command["channel_id"],
-                user=command["user_id"],
-                text="Usage: `/link <flaude_token>`\nFlaude 앱의 Settings에서 토큰을 복사하세요.",
-            )
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="Usage: `/link <flaude_token>`")
             return
 
         from agents.models import AuthToken
         try:
-            auth = await sync_to_async(
-                lambda: AuthToken.objects.select_related("user").get(token=token)
-            )()
+            auth = await sync_to_async(lambda: AuthToken.objects.select_related("user").get(token=token))()
             await sync_to_async(UserPlatformLink.objects.update_or_create)(
-                platform="slack",
-                platform_user_id=command["user_id"],
-                defaults={
-                    "user": auth.user,
-                    "platform_team_id": command.get("team_id", ""),
-                },
+                platform="slack", platform_user_id=command["user_id"],
+                defaults={"user": auth.user, "platform_team_id": command.get("team_id", "")},
             )
             user_name = auth.user.first_name or auth.user.email
             await client.chat_postEphemeral(
-                channel=command["channel_id"],
-                user=command["user_id"],
-                text=f"연결 완료! Slack 계정이 *{user_name}*에 연결되었습니다.\n"
-                     f"이제 `/ask` 명령 시 당신의 맥에서 에이전트가 실행됩니다.",
+                channel=command["channel_id"], user=command["user_id"],
+                text=f"연결 완료! Slack 계정이 *{user_name}*에 연결되었습니다.",
             )
         except AuthToken.DoesNotExist:
-            await client.chat_postEphemeral(
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="유효하지 않은 토큰입니다.")
+
+    # ── /approve ─────────────────────────────────────────
+    @app.command("/approve")
+    async def handle_approve(ack, command, client):
+        await ack()
+        text = (command.get("text") or "").strip()
+        if not text or not text.isdigit():
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="Usage: `/approve <id>`")
+            return
+
+        approval_id = int(text)
+        try:
+            from agents.models import ApprovalRequest
+            approval = await sync_to_async(
+                lambda: ApprovalRequest.objects.select_related("team", "agent", "next_agent").get(
+                    id=approval_id, status="pending"
+                )
+            )()
+            approval.status = "approved"
+            approval.decided_by = command.get("user_id", "")
+            from django.utils import timezone as tz
+            approval.decided_at = tz.now()
+            await sync_to_async(approval.save)(update_fields=["status", "decided_by", "decided_at"])
+
+            next_name = await sync_to_async(lambda: approval.next_agent.name)()
+            await client.chat_postMessage(
                 channel=command["channel_id"],
-                user=command["user_id"],
-                text="유효하지 않은 토큰입니다. Flaude 앱 Settings에서 정확한 토큰을 복사해주세요.",
+                text=f"✅ 승인 완료! *{next_name}* 실행을 시작합니다..."
             )
 
-    # ── Channel-based routing + thread resume ──────────────
+            team_result = await resume_after_approval(approval)
+            for r in team_result.results:
+                blocks = format_agent_response(r.agent_name, r.role, r.result)
+                await client.chat_postMessage(channel=command["channel_id"], blocks=blocks, text=f"[{r.agent_name}]\n{r.result}")
+
+        except ApprovalRequest.DoesNotExist:
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="해당 승인 요청을 찾을 수 없습니다.")
+
+    # ── /reject ──────────────────────────────────────────
+    @app.command("/reject")
+    async def handle_reject(ack, command, client):
+        await ack()
+        text = (command.get("text") or "").strip()
+        if not text or not text.isdigit():
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="Usage: `/reject <id>`")
+            return
+
+        approval_id = int(text)
+        try:
+            from agents.models import ApprovalRequest
+            approval = await sync_to_async(
+                lambda: ApprovalRequest.objects.select_related("team", "next_agent").get(
+                    id=approval_id, status="pending"
+                )
+            )()
+            approval.status = "rejected"
+            approval.decided_by = command.get("user_id", "")
+            from django.utils import timezone as tz
+            approval.decided_at = tz.now()
+            await sync_to_async(approval.save)(update_fields=["status", "decided_by", "decided_at"])
+
+            next_name = await sync_to_async(lambda: approval.next_agent.name)()
+            await client.chat_postMessage(
+                channel=command["channel_id"],
+                text=f"❌ 거절됨. *{next_name}* 실행이 취소되었습니다."
+            )
+        except ApprovalRequest.DoesNotExist:
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="해당 승인 요청을 찾을 수 없습니다.")
+
+    # ── /approvals ───────────────────────────────────────
+    @app.command("/approvals")
+    async def handle_approvals(ack, command, client):
+        await ack()
+        pending = await get_pending_approvals()
+        if not pending:
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="대기 중인 승인이 없습니다.")
+            return
+        lines = []
+        for a in pending:
+            lines.append(
+                f"⏸️ ID: `{a['id']}` — *{a['team_name']}*: "
+                f"{a['agent_name']} → {a['next_agent_name']}\n"
+                f"  > {a['result_preview'][:100]}...\n"
+                f"  `/approve {a['id']}` 또는 `/reject {a['id']}`"
+            )
+        await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="\n\n".join(lines))
+
+    # ── /schedule ────────────────────────────────────────
+    @app.command("/schedule")
+    async def handle_schedule(ack, command, client):
+        await ack()
+        from agents.models import AgentSchedule
+        schedules = await sync_to_async(
+            lambda: list(AgentSchedule.objects.filter(is_active=True).select_related("agent", "team")[:20])
+        )()
+        if not schedules:
+            await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="등록된 스케줄이 없습니다.")
+            return
+        lines = []
+        for s in schedules:
+            target = s.agent.name if s.agent else (s.team.name if s.team else "?")
+            last = s.last_run_at.strftime("%m/%d %H:%M") if s.last_run_at else "없음"
+            lines.append(
+                f"⏰ *{s.name}* — `{s.cron_expression}`\n"
+                f"  대상: {target} | 마지막 실행: {last}"
+            )
+        await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="\n\n".join(lines))
+
+    # ── /help ────────────────────────────────────────────
+    @app.command("/help")
+    async def handle_help(ack, command, client):
+        await ack()
+        agents = await get_active_agents()
+        agent_names = ", ".join(f"`{a.name}`" for a in agents) or "(없음)"
+        teams = await get_all_teams()
+        team_names = ", ".join(f"`{t.name}`" for t in teams) or "(없음)"
+
+        text = (
+            "*Flaude 사용법*\n\n"
+            "*메시지 보내기* (일반 채팅으로)\n"
+            "`@멤버이름 메시지` — 예: `@ria 안녕`\n"
+            "`@팀이름 메시지` — 예: `@sales 분석해줘`\n\n"
+            "*스레드*\n"
+            "에이전트 답변 스레드에서 `@` 없이 그냥 메시지만 보내면 세션이 유지됩니다.\n\n"
+            "*슬래시 명령어*\n"
+            "`/agents` — 멤버 목록\n"
+            "`/teams` — 팀 목록\n"
+            "`/status` — 실행 중인 작업\n"
+            "`/history` — 실행 이력\n"
+            "`/client` — 클라이언트 등록\n"
+            "`/approvals` — 대기 중인 승인 목록\n"
+            "`/approve <id>` — 워크플로우 승인\n"
+            "`/reject <id>` — 워크플로우 거절\n"
+            "`/schedule` — 스케줄 목록\n"
+            "`/link` — Flaude 계정 연결\n\n"
+            f"*멤버*: {agent_names}\n"
+            f"*팀*: {team_names}"
+        )
+        await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text=text)
+
+    # ── Message handler: @agent routing + thread resume ──
     @app.event("message")
     async def handle_message(event, client):
         if event.get("bot_id") or event.get("subtype"):
@@ -461,38 +486,104 @@ def create_slack_app(token: str) -> AsyncApp:
             return
 
         channel_id = event.get("channel", "")
-        thread_ts = event.get("thread_ts")  # None if top-level message
+        thread_ts = event.get("thread_ts")
 
-        # Thread follow-up: resume session if we know this thread
-        if thread_ts and thread_ts in _thread_agents:
-            agent_name = _thread_agents[thread_ts]
-            agent = await find_agent_by_name(agent_name)
-            if agent:
-                result = await run_claude(agent, user_text, session_id=_thread_to_uuid(thread_ts), resume=True)
-                blocks = format_agent_response(agent.name, agent.role, result)
-                await client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=thread_ts,
-                    blocks=blocks,
-                    text=f"[{agent.name} · {agent.role}]\n{result}",
-                )
-                return
+        # Thread follow-up: check in-memory first, then DB
+        if thread_ts:
+            agent_name = _thread_agents.get(thread_ts) or await _get_thread_agent("slack", thread_ts)
+            if agent_name:
+                _thread_agents[thread_ts] = agent_name
+                agent = await find_agent_by_name(agent_name)
+                if agent:
+                    context_prompt = await _build_thread_prompt("slack", thread_ts, user_text)
+                    await _save_thread_msg("slack", thread_ts, agent.name, "user", user_text)
+                    result = await run_claude(agent, context_prompt, platform="slack")
+                    await _save_thread_msg("slack", thread_ts, agent.name, "agent", result)
+                    blocks = format_agent_response(agent.name, agent.role, result)
+                    await client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, blocks=blocks, text=f"[{agent.name}]\n{result}")
+                    return
 
-        # Channel-based routing (top-level messages only)
+        # @agent_name message 패턴
+        if user_text.startswith("@"):
+            parts = user_text[1:].split(None, 1)
+            if len(parts) >= 2:
+                target_name = parts[0]
+                user_message = parts[1]
+
+                # 팀인지 확인
+                team = await find_team_by_name(target_name)
+                if team:
+                    agents_with_meta = await get_team_agents_with_meta(team)
+                    if agents_with_meta:
+                        initial = await client.chat_postMessage(channel=channel_id, text=f"*{team.name}* 팀이 작업을 시작합니다...")
+                        team_result = await run_team(team, agents_with_meta, user_message, platform="slack")
+
+                        for r in team_result.results:
+                            if r.display_mode in ("status", "intermediate"):
+                                label = "✅" if r.display_mode == "status" else "📋"
+                                await client.chat_postMessage(channel=channel_id, thread_ts=initial["ts"], text=f"{label} *{r.agent_name}* ({r.role}) 완료")
+                            elif r.display_mode == "full":
+                                blocks = format_agent_response(r.agent_name, r.role, r.result)
+                                await client.chat_postMessage(channel=channel_id, thread_ts=initial["ts"], blocks=blocks, text=f"[{r.agent_name}]\n{r.result}")
+
+                        if team_result.synthesis:
+                            s = team_result.synthesis
+                            blocks = format_agent_response(s.agent_name, s.role, s.result)
+                            await client.chat_postMessage(channel=channel_id, thread_ts=initial["ts"], blocks=blocks, text=f"[{s.agent_name}]\n{s.result}")
+                        return
+
+                # 에이전트인지 확인
+                agent = await find_agent_by_name(target_name)
+                if agent:
+                    flaude_user_id = await resolve_slack_user(event.get("user", ""))
+                    result = None
+                    if flaude_user_id:
+                        from agents.dispatch import dispatch_task
+                        result = await dispatch_task(str(flaude_user_id), agent.name, user_message)
+
+                    if not result:
+                        context = await _fetch_slack_channel_context(client, channel_id)
+                        prompt = context + user_message if context else user_message
+                        result = await run_claude(agent, prompt, platform="slack")
+
+                    # 에이전트 답변을 스레드로
+                    reply_ts = thread_ts or event.get("ts")
+                    _thread_agents[reply_ts] = agent.name
+                    await _save_thread_msg("slack", reply_ts, agent.name, "user", user_message)
+                    await _save_thread_msg("slack", reply_ts, agent.name, "agent", result)
+                    blocks = format_agent_response(agent.name, agent.role, result)
+                    await client.chat_postMessage(channel=channel_id, thread_ts=reply_ts, blocks=blocks, text=f"[{agent.name}]\n{result}")
+                    return
+
+        # Channel-based routing
         agent = await find_agent_for_channel(channel_id)
         if not agent:
             return
 
-        result = await run_claude(agent, user_text)
-        blocks = format_agent_response(agent.name, agent.role, result)
         reply_ts = thread_ts or event.get("ts")
+        if thread_ts:
+            agent_name_ch = _thread_agents.get(thread_ts) or await _get_thread_agent("slack", thread_ts)
+            if agent_name_ch:
+                context_prompt = await _build_thread_prompt("slack", thread_ts, user_text)
+                await _save_thread_msg("slack", thread_ts, agent.name, "user", user_text)
+                result = await run_claude(agent, context_prompt, platform="slack")
+                await _save_thread_msg("slack", thread_ts, agent.name, "agent", result)
+            else:
+                context = await _fetch_slack_channel_context(client, channel_id)
+                prompt = context + user_text if context else user_text
+                result = await run_claude(agent, prompt, platform="slack")
+                await _save_thread_msg("slack", reply_ts, agent.name, "user", user_text)
+                await _save_thread_msg("slack", reply_ts, agent.name, "agent", result)
+        else:
+            context = await _fetch_slack_channel_context(client, channel_id)
+            prompt = context + user_text if context else user_text
+            result = await run_claude(agent, prompt, platform="slack")
+            await _save_thread_msg("slack", reply_ts, agent.name, "user", user_text)
+            await _save_thread_msg("slack", reply_ts, agent.name, "agent", result)
 
-        await client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=reply_ts,
-            blocks=blocks,
-            text=f"[{agent.name} · {agent.role}]\n{result}",
-        )
+        blocks = format_agent_response(agent.name, agent.role, result)
+        _thread_agents[reply_ts] = agent.name
+        await client.chat_postMessage(channel=channel_id, thread_ts=reply_ts, blocks=blocks, text=f"[{agent.name}]\n{result}")
 
     return app
 
@@ -504,31 +595,21 @@ class Command(BaseCommand):
     help = "Run the Flaude Slack bot"
 
     def add_arguments(self, parser):
-        parser.add_argument(
-            "--token", type=str,
-            default=os.environ.get("SLACK_BOT_TOKEN", ""),
-            help="Slack bot token (or set SLACK_BOT_TOKEN env var)",
-        )
-        parser.add_argument(
-            "--app-token", type=str,
-            default=os.environ.get("SLACK_APP_TOKEN", ""),
-            help="Slack app-level token for Socket Mode (or set SLACK_APP_TOKEN env var)",
-        )
+        parser.add_argument("--token", type=str, default=os.environ.get("SLACK_BOT_TOKEN", ""))
+        parser.add_argument("--app-token", type=str, default=os.environ.get("SLACK_APP_TOKEN", ""))
 
     def handle(self, *args, **options):
         token = options["token"]
         app_token = options["app_token"]
-
         if not token:
-            self.stderr.write("Error: No Slack bot token. Set SLACK_BOT_TOKEN env var or pass --token.")
+            self.stderr.write("Error: No Slack bot token. Set SLACK_BOT_TOKEN env var.")
             return
         if not app_token:
-            self.stderr.write("Error: No Slack app token. Set SLACK_APP_TOKEN env var or pass --app-token.")
+            self.stderr.write("Error: No Slack app token. Set SLACK_APP_TOKEN env var.")
             return
 
         logging.basicConfig(level=logging.INFO)
         self.stdout.write("Starting Flaude Slack bot...")
-
         slack_app = create_slack_app(token)
 
         async def _run():

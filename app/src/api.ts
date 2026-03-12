@@ -55,13 +55,13 @@ export type AuthStartResult = { url: string; state: string };
 export type AuthPollResult = { status: "pending" | "ok"; token?: string; email?: string; name?: string };
 
 export const authGoogleStart = () =>
-  fetch(`${API_BASE}/auth/google/start`).then(async (res) => {
+  fetch(`${getApiBase()}/auth/google/start`).then(async (res) => {
     if (!res.ok) throw new Error(await res.text());
     return res.json() as Promise<AuthStartResult>;
   });
 
 export const authGooglePoll = (state: string) =>
-  fetch(`${API_BASE}/auth/google/poll?state=${state}`).then(async (res) => {
+  fetch(`${getApiBase()}/auth/google/poll?state=${state}`).then(async (res) => {
     if (!res.ok) throw new Error(await res.text());
     return res.json() as Promise<AuthPollResult>;
   });
@@ -116,7 +116,7 @@ export type WorkspaceInvite = {
 export type AgentTeam = {
   id: number;
   name: string;
-  members: { agent_id: number; order: number; is_lead?: boolean }[];
+  members: { agent_id: number; order: number; is_lead?: boolean; condition?: string; requires_approval?: boolean }[];
   execution_mode: "sequential" | "parallel";
   created_at: string;
 };
@@ -387,4 +387,121 @@ export const deletePlatformLink = (linkId: number) =>
 export const parseClientInfo = (wsId: number, rawText: string) =>
   request<{ parsed: Record<string, string> }>(`/workspaces/${wsId}/clients/parse?raw_text=${encodeURIComponent(rawText)}`, {
     method: "POST",
+  });
+
+// ── Agent Memory ────────────────────────────────────
+
+export type AgentMemory = {
+  id: number;
+  key: string;
+  content: string;
+  source: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export const getAgentMemories = (agentId: number) =>
+  request<AgentMemory[]>(`/agents/${agentId}/memories`);
+
+export const createAgentMemory = (agentId: number, data: { key: string; content: string }) =>
+  request<AgentMemory>(`/agents/${agentId}/memories`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const deleteAgentMemory = (memoryId: number) =>
+  request<null>(`/memories/${memoryId}`, { method: "DELETE" });
+
+// ── Team Memory ─────────────────────────────────────
+
+export type TeamMemory = {
+  id: number;
+  key: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export const getTeamMemories = (teamId: number) =>
+  request<TeamMemory[]>(`/agent-teams/${teamId}/memories`);
+
+export const createTeamMemory = (teamId: number, data: { key: string; content: string }) =>
+  request<TeamMemory>(`/agent-teams/${teamId}/memories`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const deleteTeamMemory = (memoryId: number) =>
+  request<null>(`/team-memories/${memoryId}`, { method: "DELETE" });
+
+// ── Client Timeline ─────────────────────────────────
+
+export type TimelineEntry = {
+  id: number;
+  type: "history" | "execution";
+  agent_name: string;
+  action: string;
+  detail: string;
+  created_at: string;
+};
+
+export const getClientTimeline = (clientId: number) =>
+  request<TimelineEntry[]>(`/clients/${clientId}/timeline`);
+
+// ── Schedules ───────────────────────────────────────
+
+export type Schedule = {
+  id: number;
+  name: string;
+  agent_id: number | null;
+  team_id: number | null;
+  cron_expression: string;
+  prompt: string;
+  client_id: number | null;
+  notification_channel: string;
+  is_active: boolean;
+  last_run_at: string | null;
+  created_at: string;
+};
+
+export const getSchedules = (wsId: number) =>
+  request<Schedule[]>(`/workspaces/${wsId}/schedules`);
+
+export const createSchedule = (wsId: number, data: Partial<Schedule>) =>
+  request<Schedule>(`/workspaces/${wsId}/schedules`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const updateSchedule = (scheduleId: number, data: Partial<Schedule>) =>
+  request<Schedule>(`/schedules/${scheduleId}`, {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+
+export const deleteSchedule = (scheduleId: number) =>
+  request<null>(`/schedules/${scheduleId}`, { method: "DELETE" });
+
+// ── Approvals ───────────────────────────────────────
+
+export type Approval = {
+  id: number;
+  team_name: string;
+  agent_name: string;
+  next_agent_name: string;
+  result_preview: string;
+  prompt: string;
+  status: string;
+  platform: string;
+  created_at: string;
+  decided_at: string | null;
+};
+
+export const getPendingApprovals = () =>
+  request<Approval[]>("/approvals/pending");
+
+export const decideApproval = (approvalId: number, decision: "approved" | "rejected") =>
+  request<{ ok: boolean }>(`/approvals/${approvalId}/decide`, {
+    method: "POST",
+    body: JSON.stringify({ decision }),
   });
