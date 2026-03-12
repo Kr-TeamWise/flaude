@@ -16,6 +16,8 @@ Features:
 import asyncio
 import os
 import logging
+from collections import OrderedDict
+from urllib.parse import quote
 
 import discord
 from discord import app_commands
@@ -142,41 +144,68 @@ def save_client_to_db(parsed: dict, workspace_id: int | None) -> None:
         )
 
 
-# ── Session tracking ─────────────────────────────────────────
+# ── Session tracking (LRU caches to prevent memory leaks) ────
 
-_thread_agents: dict[str, str] = {}
-_thread_locks: dict[str, asyncio.Lock] = {}  # prevent concurrent runs per thread
+_MAX_CACHE = 500
+
+
+class _LRUCache(OrderedDict):
+    """Simple LRU cache with max size."""
+    def __init__(self, maxsize: int = _MAX_CACHE):
+        super().__init__()
+        self._maxsize = maxsize
+
+    def get_val(self, key, default=None):
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        return default
+
+    def set_val(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        self[key] = value
+        while len(self) > self._maxsize:
+            self.popitem(last=False)
+
+
+_thread_agents = _LRUCache(_MAX_CACHE)
+_thread_locks = _LRUCache(_MAX_CACHE)
 
 
 @sync_to_async
 def _save_thread_msg(platform: str, thread_id: str, agent_name: str, role: str, content: str):
     ThreadMessage.objects.create(
         platform=platform, thread_id=thread_id,
-        agent_name=agent_name, role=role, content=content[:1000],
+        agent_name=agent_name, role=role, content=content[:2000],
     )
-    ids = list(
+    # Efficient cleanup: keep only latest 20 messages per thread
+    keep_ids = list(
         ThreadMessage.objects.filter(platform=platform, thread_id=thread_id)
-        .order_by("-created_at").values_list("id", flat=True)[20:]
+        .order_by("-created_at").values_list("id", flat=True)[:20]
     )
-    if ids:
-        ThreadMessage.objects.filter(id__in=ids).delete()
+    if keep_ids:
+        ThreadMessage.objects.filter(
+            platform=platform, thread_id=thread_id,
+        ).exclude(id__in=keep_ids).delete()
 
 
 @sync_to_async
 def _get_thread_agent_db(platform: str, thread_id: str) -> str | None:
     last = ThreadMessage.objects.filter(
         platform=platform, thread_id=thread_id, role="agent"
-    ).order_by("-created_at").first()
-    return last.agent_name if last else None
+    ).order_by("-created_at").values_list("agent_name", flat=True).first()
+    return last
 
 
 @sync_to_async
 def _get_thread_history(platform: str, thread_id: str) -> list[dict]:
     """Load conversation history from DB for a thread."""
-    msgs = ThreadMessage.objects.filter(
-        platform=platform, thread_id=thread_id,
-    ).order_by("created_at")[:20]
-    return [{"role": m.role, "agent": m.agent_name, "content": m.content} for m in msgs]
+    msgs = list(
+        ThreadMessage.objects.filter(platform=platform, thread_id=thread_id)
+        .order_by("created_at").values("role", "agent_name", "content")[:20]
+    )
+    return [{"role": m["role"], "agent": m["agent_name"], "content": m["content"]} for m in msgs]
 
 
 def _build_thread_prompt(history: list[dict], new_message: str, channel_context: str = "") -> str:
@@ -189,22 +218,26 @@ def _build_thread_prompt(history: list[dict], new_message: str, channel_context:
         for msg in history:
             prefix = "사용자" if msg["role"] == "user" else msg["agent"]
             parts.append(f"{prefix}: {msg['content']}")
-        parts.append("")  # blank line separator
+        parts.append("")
     parts.append(f"사용자: {new_message}")
     return "\n".join(parts)
 
 
 async def _fetch_channel_context(channel, limit: int = 15) -> str:
     """Fetch recent messages from channel as context."""
-    messages = []
-    async for msg in channel.history(limit=limit):
-        if msg.content and not msg.content.startswith("/"):
-            author = msg.author.display_name
-            messages.append(f"{author}: {msg.content[:300]}")
-    if not messages:
+    try:
+        messages = []
+        async for msg in channel.history(limit=limit):
+            if msg.content and not msg.content.startswith("/"):
+                author = msg.author.display_name
+                messages.append(f"{author}: {msg.content[:300]}")
+        if not messages:
+            return ""
+        messages.reverse()
+        return "[채널 최근 메시지]\n" + "\n".join(messages) + "\n\n"
+    except Exception as e:
+        logger.warning("Failed to fetch channel context: %s", e)
         return ""
-    messages.reverse()
-    return "[채널 최근 메시지]\n" + "\n".join(messages) + "\n\n"
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -241,7 +274,8 @@ _AVATAR_BG = ["F9C4AC", "B8E0D2", "D4C5F9", "F9E2AE", "A8D8EA", "F5B7B1", "C3E8B
 def _avatar_url(agent_name: str) -> str:
     h = sum(ord(c) for c in agent_name)
     bg = _AVATAR_BG[h % len(_AVATAR_BG)]
-    return f"https://api.dicebear.com/9.x/notionists/svg?seed={agent_name}&backgroundColor={bg}&backgroundType=solid"
+    seed = quote(agent_name, safe="")
+    return f"https://api.dicebear.com/9.x/notionists/png?seed={seed}&backgroundColor={bg}&backgroundType=solid&size=128"
 
 
 async def _send_agent_result(webhook, agent_name, result, thread=discord.utils.MISSING):
@@ -253,6 +287,22 @@ async def _send_agent_result(webhook, agent_name, result, thread=discord.utils.M
             avatar_url=_avatar_url(agent_name),
             thread=thread,
         )
+
+
+async def _send_agent_result_and_get(webhook, agent_name, result, thread=discord.utils.MISSING):
+    """Send agent result via webhook and return the first sent message (for thread ID tracking)."""
+    first_msg = None
+    for chunk in split_message(result):
+        msg = await webhook.send(
+            content=chunk,
+            username=agent_name,
+            avatar_url=_avatar_url(agent_name),
+            thread=thread,
+            wait=True,
+        )
+        if first_msg is None:
+            first_msg = msg
+    return first_msg
 
 
 async def _post_team_result(webhook, team_result, thread=discord.utils.MISSING):
@@ -543,45 +593,43 @@ class FlaudeBot(discord.Client):
         if message.author == self.user or message.author.bot:
             return
 
-        # ── 스레드 내 후속 질문 → --resume ──
+        # ── 스레드 내 후속 질문 ──
         if isinstance(message.channel, discord.Thread):
             thread_id = str(message.channel.id)
-            agent_name = _thread_agents.get(thread_id)
+            agent_name = _thread_agents.get_val(thread_id)
 
+            # Try to identify agent from thread starter message
             if not agent_name:
                 try:
-                    parent_channel = message.channel.parent
-                    starter = await parent_channel.fetch_message(message.channel.id)
+                    starter = await message.channel.fetch_message(message.channel.id)
                     if starter.author.bot:
                         found = await find_agent_by_name(starter.author.display_name)
                         if found:
                             agent_name = found.name
-                            _thread_agents[thread_id] = agent_name
-                except Exception as e:
-                    logger.warning("Failed to find agent for thread: %s", e)
+                            _thread_agents.set_val(thread_id, agent_name)
+                except Exception:
+                    pass
 
-            # Also check DB if not in memory
+            # Fallback: check DB
             if not agent_name:
                 agent_name = await _get_thread_agent_db("discord", thread_id)
                 if agent_name:
-                    _thread_agents[thread_id] = agent_name
+                    _thread_agents.set_val(thread_id, agent_name)
 
             if agent_name:
                 agent = await find_agent_by_name(agent_name)
                 if agent:
-                    if thread_id not in _thread_locks:
-                        _thread_locks[thread_id] = asyncio.Lock()
-                    lock = _thread_locks[thread_id]
+                    lock = _thread_locks.get_val(thread_id)
+                    if lock is None:
+                        lock = asyncio.Lock()
+                        _thread_locks.set_val(thread_id, lock)
                     if lock.locked():
                         await message.reply("이전 요청을 처리 중입니다. 잠시 기다려주세요.")
                         return
                     async with lock:
                         history = await _get_thread_history("discord", thread_id)
                         # Only fetch channel context for first message in thread
-                        if not history:
-                            channel_ctx = await _fetch_channel_context(message.channel)
-                        else:
-                            channel_ctx = ""
+                        channel_ctx = await _fetch_channel_context(message.channel.parent) if not history else ""
                         prompt = _build_thread_prompt(history, message.content, channel_ctx)
                         await _save_thread_msg("discord", thread_id, agent.name, "user", message.content)
                         async with message.channel.typing():
@@ -627,13 +675,13 @@ class FlaudeBot(discord.Client):
                         async with message.channel.typing():
                             result = await run_claude(agent, prompt, platform="discord")
 
-                    # Save to DB for thread persistence
-                    thread_id = str(message.channel.id) if isinstance(message.channel, discord.Thread) else str(message.id)
-                    _thread_agents[thread_id] = agent.name
+                    # Send result first, then save with correct thread ID
+                    sent = await _send_agent_result_and_get(webhook, agent.name, result, thread)
+                    # Use the sent message ID as thread_id — Discord threads are created from this ID
+                    thread_id = str(sent.id) if sent else str(message.id)
+                    _thread_agents.set_val(thread_id, agent.name)
                     await _save_thread_msg("discord", thread_id, agent.name, "user", user_message)
                     await _save_thread_msg("discord", thread_id, agent.name, "agent", result)
-
-                    await _send_agent_result(webhook, agent.name, result, thread)
                     return
 
         # ── Channel-based routing ──
@@ -644,12 +692,12 @@ class FlaudeBot(discord.Client):
             async with message.channel.typing():
                 result = await run_claude(agent, prompt, platform="discord")
             webhook = await get_or_create_webhook(message.channel)
-            # Save for thread continuity
-            reply_id = str(message.id)
-            _thread_agents[reply_id] = agent.name
+            sent = await _send_agent_result_and_get(webhook, agent.name, result)
+            # Use sent message ID so thread creation maps correctly
+            reply_id = str(sent.id) if sent else str(message.id)
+            _thread_agents.set_val(reply_id, agent.name)
             await _save_thread_msg("discord", reply_id, agent.name, "user", message.content)
             await _save_thread_msg("discord", reply_id, agent.name, "agent", result)
-            await _send_agent_result(webhook, agent.name, result)
 
 
 def _format_parsed(parsed: dict) -> str:

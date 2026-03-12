@@ -14,6 +14,7 @@ import os
 import uuid
 import logging
 from dataclasses import dataclass, field
+from typing import Optional
 
 from asgiref.sync import sync_to_async
 from django.utils import timezone
@@ -26,11 +27,6 @@ from .models import (
 logger = logging.getLogger("flaude.orchestrator")
 
 
-def _thread_to_uuid(platform: str, thread_id: str) -> str:
-    """Convert platform thread ID to a deterministic UUID."""
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{platform}-thread:{thread_id}"))
-
-
 # ── Memory & Context ─────────────────────────────────────────
 
 
@@ -40,18 +36,31 @@ def build_context_prompt(agent: Agent, base_prompt: str, client: Client | None =
     parts = []
 
     # 1. Agent persistent memories
-    memories = AgentMemory.objects.filter(agent=agent).order_by("-updated_at")[:20]
+    memories = list(
+        AgentMemory.objects.filter(agent=agent)
+        .order_by("-updated_at").values_list("key", "content")[:20]
+    )
     if memories:
-        mem_text = "\n".join(f"- {m.key}: {m.content}" for m in memories)
+        mem_text = "\n".join(f"- {k}: {v}" for k, v in memories)
         parts.append(f"[에이전트 메모리]\n{mem_text}")
 
-    # 2. Team shared memories (if agent belongs to any team)
-    for team in AgentTeam.objects.all():
-        if any(m.get("agent_id") == agent.id for m in (team.members or [])):
-            team_mems = TeamMemory.objects.filter(team=team).order_by("-updated_at")[:10]
-            if team_mems:
-                tm_text = "\n".join(f"- {m.key}: {m.content}" for m in team_mems)
-                parts.append(f"[팀 '{team.name}' 공유 지식]\n{tm_text}")
+    # 2. Team shared memories — single query instead of N+1 loop
+    agent_teams = AgentTeam.objects.all()
+    my_team_ids = [
+        t.id for t in agent_teams
+        if any(m.get("agent_id") == agent.id for m in (t.members or []))
+    ]
+    if my_team_ids:
+        team_mems = list(
+            TeamMemory.objects.filter(team_id__in=my_team_ids)
+            .select_related("team").order_by("-updated_at")[:20]
+        )
+        if team_mems:
+            by_team: dict[str, list[str]] = {}
+            for m in team_mems:
+                by_team.setdefault(m.team.name, []).append(f"- {m.key}: {m.content}")
+            for team_name, items in by_team.items():
+                parts.append(f"[팀 '{team_name}' 공유 지식]\n" + "\n".join(items[:10]))
 
     # 3. Client context
     if client:
@@ -229,7 +238,16 @@ async def run_claude(
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
-    stdout, stderr = await proc.communicate()
+
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        duration_ms = int((asyncio.get_event_loop().time() - start) * 1000)
+        result = "Error: 실행 시간 초과 (5분)"
+        await _complete_log(log, result, "failed", duration_ms)
+        return result
 
     duration_ms = int((asyncio.get_event_loop().time() - start) * 1000)
 

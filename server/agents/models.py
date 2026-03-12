@@ -248,7 +248,7 @@ class UserPlatformLink(models.Model):
 class ThreadMessage(models.Model):
     """Persisted chat history for Discord/Slack threads."""
     platform = models.CharField(max_length=20)  # "discord" or "slack"
-    thread_id = models.CharField(max_length=100, db_index=True)
+    thread_id = models.CharField(max_length=100)
     agent_name = models.CharField(max_length=100)
     role = models.CharField(max_length=10)  # "user" or "agent"
     content = models.TextField()
@@ -256,3 +256,7 @@ class ThreadMessage(models.Model):
 
     class Meta:
         ordering = ["created_at"]
+        indexes = [
+            models.Index(fields=["platform", "thread_id"]),
+            models.Index(fields=["platform", "thread_id", "-created_at"]),
+        ]
