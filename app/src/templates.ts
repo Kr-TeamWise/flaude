@@ -23,7 +23,7 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
   // ────────────────────────────────────────────────────
   {
     id: "researcher",
-    name: "리서처",
+    name: "Ria",
     role: "Market Research",
     icon: "🔍",
     description:
@@ -98,7 +98,7 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
   // ────────────────────────────────────────────────────
   {
     id: "sales",
-    name: "세일즈",
+    name: "Kade",
     role: "Sales Outreach",
     icon: "📧",
     description:
@@ -396,7 +396,7 @@ gws gmail drafts create --to "customer@company.com" --subject "Re: 문의 건" -
   // ────────────────────────────────────────────────────
   {
     id: "assistant",
-    name: "어시스턴트",
+    name: "Noa",
     role: "Assistant",
     icon: "📋",
     description:

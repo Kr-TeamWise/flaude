@@ -755,6 +755,142 @@ export const BUILT_IN_TOOLS = [
   "Grep",
 ];
 
+// ── User-friendly permission groups ─────────────────
+// These map to Agent SDK allowedTools/disallowedTools but are
+// displayed as business-friendly capabilities for non-technical founders.
+export type PermissionGroup = {
+  id: string;
+  ko: string;
+  en: string;
+  description: { ko: string; en: string };
+  /** Actual Agent SDK tool names this group maps to */
+  sdkTools: string[];
+  /** If true, requires GWS integration enabled */
+  requiresGws?: boolean;
+};
+
+export const PERMISSION_GROUPS: PermissionGroup[] = [
+  {
+    id: "web-research",
+    ko: "인터넷 조사",
+    en: "Web Research",
+    description: { ko: "구글 검색, 웹페이지 읽기", en: "Google search, read web pages" },
+    sdkTools: ["WebSearch", "WebFetch"],
+  },
+  {
+    id: "file-access",
+    ko: "파일 읽기/쓰기",
+    en: "File Access",
+    description: { ko: "로컬 파일 읽기, 쓰기, 수정", en: "Read, write, edit local files" },
+    sdkTools: ["Read", "Write", "Edit", "Glob", "Grep"],
+  },
+  {
+    id: "run-commands",
+    ko: "명령어 실행",
+    en: "Run Commands",
+    description: { ko: "터미널 명령어 실행 (gws 등)", en: "Execute terminal commands (gws, etc.)" },
+    sdkTools: ["Bash"],
+  },
+  {
+    id: "gmail-read",
+    ko: "이메일 읽기",
+    en: "Read Emails",
+    description: { ko: "Gmail 수신함 조회, 이메일 읽기", en: "View inbox, read emails" },
+    sdkTools: ["Bash"],
+    requiresGws: true,
+  },
+  {
+    id: "gmail-send",
+    ko: "이메일 발송",
+    en: "Send Emails",
+    description: { ko: "Gmail로 이메일 작성 및 발송", en: "Compose and send emails via Gmail" },
+    sdkTools: ["Bash"],
+    requiresGws: true,
+  },
+  {
+    id: "calendar",
+    ko: "일정 관리",
+    en: "Calendar",
+    description: { ko: "Google Calendar 조회, 일정 생성", en: "View and create Google Calendar events" },
+    sdkTools: ["Bash"],
+    requiresGws: true,
+  },
+  {
+    id: "drive",
+    ko: "Google Drive",
+    en: "Google Drive",
+    description: { ko: "Drive 파일 검색, 다운로드", en: "Search and download Drive files" },
+    sdkTools: ["Bash"],
+    requiresGws: true,
+  },
+];
+
+/**
+ * Convert permission group IDs → Agent SDK allowedTools list.
+ * GWS groups all need Bash, so we deduplicate.
+ */
+export function permissionGroupsToSdkTools(groupIds: string[]): string[] {
+  const tools = new Set<string>();
+  for (const gid of groupIds) {
+    const group = PERMISSION_GROUPS.find((g) => g.id === gid);
+    if (group) {
+      for (const t of group.sdkTools) tools.add(t);
+    }
+  }
+  return [...tools];
+}
+
+/**
+ * Convert Agent SDK allowedTools → permission group IDs for display.
+ * Best-effort reverse mapping.
+ */
+export function sdkToolsToPermissionGroups(tools: string[], hasGws: boolean): string[] {
+  const groups: string[] = [];
+  const toolSet = new Set(tools);
+
+  for (const g of PERMISSION_GROUPS) {
+    if (g.requiresGws && !hasGws) continue;
+    // A group is "on" if all its sdkTools are in the allowed list
+    if (g.sdkTools.every((t) => toolSet.has(t))) {
+      groups.push(g.id);
+    }
+  }
+  return groups;
+}
+
+/**
+ * Build disallowedTools from NOT-allowed permission group IDs.
+ * For GWS groups, we add specific Bash(gws ...) restrictions to instructions instead.
+ */
+export function permissionGroupsToDisallowed(notAllowedGroupIds: string[]): string[] {
+  const tools = new Set<string>();
+  for (const gid of notAllowedGroupIds) {
+    const group = PERMISSION_GROUPS.find((g) => g.id === gid);
+    if (group && !group.requiresGws) {
+      for (const t of group.sdkTools) tools.add(t);
+    }
+  }
+  return [...tools];
+}
+
+/**
+ * Build GWS restriction instructions from not-allowed GWS groups.
+ * Since GWS groups all use Bash, we can't just disallow Bash.
+ * Instead we inject explicit "절대 사용 금지" instructions.
+ */
+export function buildGwsRestrictions(notAllowedGroupIds: string[], lang: "ko" | "en"): string {
+  const gwsRestricted = notAllowedGroupIds
+    .map((id) => PERMISSION_GROUPS.find((g) => g.id === id))
+    .filter((g): g is PermissionGroup => !!g && !!g.requiresGws);
+
+  if (gwsRestricted.length === 0) return "";
+
+  const labels = gwsRestricted.map((g) => g[lang]).join(", ");
+  return lang === "ko"
+    ? `\n\n## 금지 사항\n다음 기능은 절대 사용하지 마세요: ${labels}.\n관련 gws 명령어를 실행하면 안 됩니다.`
+    : `\n\n## Restrictions\nDo NOT use the following: ${labels}.\nDo not run related gws commands.`;
+}
+
 // ── Friendly tool names for non-technical users ─────
 export const TOOL_DISPLAY: Record<string, { ko: string; en: string }> = {
   WebSearch: { ko: "인터넷 검색", en: "Web Search" },

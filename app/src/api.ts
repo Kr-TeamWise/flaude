@@ -1,4 +1,4 @@
-const SERVER_URL = import.meta.env.VITE_SERVER_URL || "https://flaude.com";
+export const SERVER_URL = import.meta.env.VITE_SERVER_URL || "https://flaude.com";
 
 function getApiBase(): string {
   return `${SERVER_URL}/api`;
@@ -163,6 +163,7 @@ export type AgentTeamRunResult = {
   team_name: string;
   execution_mode: string;
   prompt: string;
+  sdk_session_id?: string;
   agents: {
     agent_id: number;
     name: string;

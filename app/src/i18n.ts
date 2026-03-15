@@ -2,6 +2,7 @@ export type Lang = "ko" | "en";
 
 const translations = {
   // Nav
+  "nav.chat": { ko: "대화", en: "Chat" },
   "nav.members": { ko: "팀원", en: "Members" },
   "nav.teams": { ko: "팀", en: "Teams" },
   "nav.clients": { ko: "고객관리", en: "Clients" },
@@ -46,8 +47,6 @@ const translations = {
   "team.name": { ko: "팀 이름", en: "Team Name" },
   "team.members": { ko: "팀원", en: "Members" },
   "team.run": { ko: "팀 실행", en: "Run Team" },
-  "team.sequential": { ko: "순차", en: "Sequential" },
-  "team.parallel": { ko: "병렬", en: "Parallel" },
   "team.lead": { ko: "리드", en: "Lead" },
 
   // Clients
@@ -143,6 +142,11 @@ const translations = {
   "hire.channelHint": { ko: "채널 ID, 쉼표로 구분", en: "Channel IDs, comma-separated" },
   "hire.channelPlaceholder": { ko: "예: 1234567890, 9876543210", en: "e.g. 1234567890, 9876543210" },
 
+  // Chat page
+  "chat.title": { ko: "대화", en: "Chat" },
+  "chat.selectAgent": { ko: "대화할 팀원을 선택하세요", en: "Select a member to chat with" },
+  "chat.newConversation": { ko: "새 대화", en: "New Conversation" },
+
   // Agent chat
   "chat.thinking": { ko: "생각하는 중...", en: "Thinking..." },
   "chat.send": { ko: "보내기", en: "Send" },
@@ -161,9 +165,6 @@ const translations = {
   "team.subtitle": { ko: "리드가 팀을 조율하고, 팀원이 실행합니다.", en: "Lead coordinates, members execute." },
   "team.newTeam": { ko: "새 팀", en: "New Team" },
   "team.noTeams": { ko: "아직 팀이 없습니다.", en: "No teams yet." },
-  "team.executionMode": { ko: "실행 방식", en: "Execution Mode" },
-  "team.seqDesc": { ko: "순차 (A → B → C)", en: "Sequential (A → B → C)" },
-  "team.parDesc": { ko: "병렬 (A + B + C)", en: "Parallel (A + B + C)" },
   "team.memberHint": { ko: "클릭하면 추가, 한 번 더 클릭하면 리드", en: "Click to add, click again for Lead" },
   "team.hireFirst": { ko: "팀원을 먼저 채용하세요.", en: "Hire members first." },
 
