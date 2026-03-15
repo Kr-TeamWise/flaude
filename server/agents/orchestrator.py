@@ -2,7 +2,7 @@
 Shared agent orchestration — used by both Discord and Slack bots.
 
 Provides:
-  - run_claude(): Execute a single agent via Claude Code CLI
+  - execute_agent(): Execute a single agent via SDK dispatch
   - run_team(): Execute a team of agents (sequential/parallel) with conditions
   - build_context_prompt(): Inject memory + client context
   - auto_advance_client_status(): Auto-advance client pipeline
@@ -10,7 +10,7 @@ Provides:
 """
 
 import asyncio
-import os
+import json
 import uuid
 import logging
 from dataclasses import dataclass, field
@@ -154,7 +154,7 @@ def _evaluate_condition(condition: str, previous_result: str) -> bool:
     return True
 
 
-# ── Claude subprocess runner ─────────────────────────────────
+# ── Execution Log helpers ────────────────────────────────────
 
 
 @sync_to_async
@@ -173,93 +173,93 @@ def _create_log(
 
 
 @sync_to_async
-def _complete_log(log: ExecutionLog, result: str, status: str, duration_ms: int):
+def _complete_log(
+    log: ExecutionLog, result: str, status: str, duration_ms: int,
+    sdk_session_id: str = "", cost_usd: float | None = None,
+    num_turns: int | None = None,
+):
     log.result = result[:5000]
     log.status = status
     log.duration_ms = duration_ms
+    log.sdk_session_id = sdk_session_id
+    log.cost_usd = cost_usd
+    log.num_turns = num_turns
     log.completed_at = timezone.now()
-    log.save(update_fields=["result", "status", "duration_ms", "completed_at"])
+    log.save(update_fields=[
+        "result", "status", "duration_ms", "completed_at",
+        "sdk_session_id", "cost_usd", "num_turns",
+    ])
 
 
-async def run_claude(
+# ── Agent execution via SDK dispatch ─────────────────────────
+
+
+async def execute_agent(
     agent: Agent,
     prompt: str,
+    user_id: int | str,
     session_id: str | None = None,
     resume: bool = False,
     platform: str = "app",
     team_run_id: str = "",
     client: Client | None = None,
-) -> str:
-    """Run claude --print subprocess with agent config. Logs execution.
-    If client is provided, injects client context and agent memory into prompt.
-    """
+    subagents: dict | None = None,
+) -> tuple[str, str | None]:
+    """Execute agent via dispatch to user's Mac. Returns (result, sdk_session_id)."""
     if not prompt or not prompt.strip():
-        return "Error: 빈 메시지입니다."
+        return "Error: 빈 메시지입니다.", None
 
-    # Inject memory & context
+    from .dispatch import dispatch_task
+
     enriched_prompt = await build_context_prompt(agent, prompt, client)
-
     log = await _create_log(agent, prompt, platform, team_run_id, client)
     start = asyncio.get_event_loop().time()
 
-    cmd = [
-        "claude", "--print",
-        "--model", "opus",
-        "--permission-mode", "bypassPermissions",
-    ]
+    sdk_config = {
+        "prompt": enriched_prompt,
+        "systemPrompt": agent.instructions or "",
+        "allowedTools": agent.tools or [],
+        "disallowedTools": agent.not_allowed or [],
+        "agents": subagents or {},
+        "sessionId": session_id,
+        "resume": resume,
+        "model": "opus",
+        "permissionMode": "bypassPermissions",
+        "enableCheckpointing": True,
+    }
 
-    # --system-prompt only on new sessions (not resume), and only if non-empty
-    if not resume and agent.instructions and agent.instructions.strip():
-        cmd += ["--system-prompt", agent.instructions]
-
-    if agent.tools:
-        cmd += ["--allowedTools", ",".join(agent.tools)]
-    if agent.not_allowed:
-        cmd += ["--disallowedTools", ",".join(agent.not_allowed)]
-
-    if session_id:
-        if resume:
-            cmd += ["--resume", session_id]
-        else:
-            cmd += ["--session-id", session_id]
-
-    # prompt as positional arg at the end (after -- to prevent flag confusion)
-    cmd.append("--")
-    cmd.append(enriched_prompt)
-
-    logger.debug("run_claude cmd: %s", " ".join(repr(c) for c in cmd))
-
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
+    result_json = await dispatch_task(
+        str(user_id),
+        agent.name,
+        json.dumps(sdk_config),
+        timeout=600,
     )
-
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        duration_ms = int((asyncio.get_event_loop().time() - start) * 1000)
-        result = "Error: 실행 시간 초과 (5분)"
-        await _complete_log(log, result, "failed", duration_ms)
-        return result
 
     duration_ms = int((asyncio.get_event_loop().time() - start) * 1000)
 
-    if proc.returncode != 0:
-        err = stderr.decode().strip()
-        result = f"Error: {err[:500]}"
-        await _complete_log(log, result, "failed", duration_ms)
-        return result
+    if not result_json:
+        await _complete_log(log, "Flaude 앱 미연결", "failed", duration_ms)
+        return "Flaude 앱이 연결되어 있지 않습니다.", None
 
-    result = stdout.decode().strip()
-    await _complete_log(log, result, "completed", duration_ms)
-    return result
+    try:
+        parsed = json.loads(result_json)
+        result = parsed.get("result", result_json)
+        sdk_session = parsed.get("session_id")
+        cost = parsed.get("cost_usd")
+        turns = parsed.get("num_turns")
+    except json.JSONDecodeError:
+        result = result_json
+        sdk_session = None
+        cost = None
+        turns = None
+
+    await _complete_log(
+        log, result, "completed", duration_ms,
+        sdk_session_id=sdk_session or "",
+        cost_usd=cost,
+        num_turns=turns,
+    )
+    return result, sdk_session
 
 
 # ── Team Orchestrator ────────────────────────────────────────
@@ -302,60 +302,42 @@ async def run_team(
     team: AgentTeam,
     agents_with_meta: list[tuple[Agent, dict]],
     prompt: str,
+    user_id: int | str,
     platform: str = "app",
     client: Client | None = None,
 ) -> TeamResult:
-    """Execute a team of agents with conditions and approval support."""
+    """Execute a team of agents via SDK subagents.
+
+    The lead agent receives workers as SDK subagents so Claude handles
+    orchestration (parallel or sequential delegation) automatically.
+    Approval gates fall back to explicit sequential execution.
+    """
     team_run_id = str(uuid.uuid4())
     result = TeamResult(execution_mode=team.execution_mode)
 
-    if team.execution_mode == "parallel":
-        workers = [(a, m) for a, m in agents_with_meta if not m.get("is_lead", False)]
-        leads = [(a, m) for a, m in agents_with_meta if m.get("is_lead", False)]
+    # Identify lead and workers
+    leads = [(a, m) for a, m in agents_with_meta if m.get("is_lead", False)]
+    workers = [(a, m) for a, m in agents_with_meta if not m.get("is_lead", False)]
 
-        tasks = [
-            run_claude(a, prompt, platform=platform, team_run_id=team_run_id, client=client)
-            for a, _ in workers
-        ]
-        outputs = await asyncio.gather(*tasks, return_exceptions=True)
+    lead_agent = leads[0][0] if leads else (workers[0][0] if workers else None)
+    # If no explicit lead, first worker becomes lead — remove from workers
+    if not leads and workers:
+        workers = workers[1:]
 
-        for (agent, _), output in zip(workers, outputs):
-            if isinstance(output, Exception):
-                output = f"Error: {output}"
-            result.results.append(AgentResult(
-                agent_name=agent.name,
-                role=agent.role,
-                result=output,
-                display_mode="intermediate",
-            ))
+    if lead_agent is None:
+        result.results.append(AgentResult(
+            agent_name="System", role="", result="팀에 활성 에이전트가 없습니다.",
+            display_mode="full",
+        ))
+        return result
 
-        if leads:
-            lead_agent, lead_meta = leads[0]
-            context_parts = []
-            for r in result.results:
-                context_parts.append(f"[{r.agent_name}의 결과]:\n{r.result}")
-            synthesis_prompt = (
-                f"다음 팀원들의 결과를 종합해서 최종 정리해주세요:\n\n"
-                f"{chr(10).join(context_parts)}\n\n"
-                f"사용자 요청: {prompt}"
-            )
-            synthesis_output = await run_claude(
-                lead_agent, synthesis_prompt,
-                platform=platform, team_run_id=team_run_id, client=client,
-            )
-            result.synthesis = AgentResult(
-                agent_name=lead_agent.name,
-                role=lead_agent.role,
-                result=synthesis_output,
-                display_mode="full",
-                is_lead=True,
-            )
-        else:
-            for r in result.results:
-                r.display_mode = "full"
+    # Check if any worker requires approval — use sequential fallback
+    needs_approval = any(
+        m.get("requires_approval", False) for _, m in workers
+    )
 
-    else:
-        # Sequential: pipe output with condition checks and approval gates
+    if needs_approval:
+        # ── Sequential fallback with approval gates ──
         accumulated_context = ""
         agents_list = [a for a, _ in agents_with_meta]
 
@@ -393,7 +375,7 @@ async def run_team(
                     result="승인 대기 중...",
                     display_mode="status",
                 ))
-                return result  # Pause execution — will be resumed on approval
+                return result  # Pause — resumed on approval
 
             if i == 0:
                 full_prompt = prompt
@@ -404,8 +386,8 @@ async def run_team(
                     f"사용자 요청: {prompt}"
                 )
 
-            output = await run_claude(
-                agent, full_prompt,
+            output, _ = await execute_agent(
+                agent, full_prompt, user_id,
                 platform=platform, team_run_id=team_run_id, client=client,
             )
             accumulated_context = output
@@ -416,6 +398,35 @@ async def run_team(
                 result=output,
                 display_mode="full" if is_last else "status",
             ))
+
+        return result
+
+    # ── SDK subagent path — Claude orchestrates delegation ──
+
+    # Build subagents map for SDK
+    subagents = {}
+    for agent, meta in workers:
+        subagents[agent.name] = {
+            "description": f"{agent.role}. {(agent.instructions or '')[:200]}",
+            "prompt": agent.instructions or f"You are {agent.name}, a {agent.role}.",
+            "tools": agent.tools or [],
+        }
+
+    # Single dispatch: lead agent + subagents
+    team_prompt = f"팀 명령: {prompt}\n\n필요한 팀원에게 작업을 위임하고 결과를 종합해주세요."
+    output, sdk_session = await execute_agent(
+        lead_agent, team_prompt, user_id,
+        platform=platform, team_run_id=team_run_id, client=client,
+        subagents=subagents if subagents else None,
+    )
+
+    result.results.append(AgentResult(
+        agent_name=lead_agent.name,
+        role=lead_agent.role,
+        result=output,
+        display_mode="full",
+        is_lead=True,
+    ))
 
     return result
 
@@ -467,7 +478,7 @@ def decide_approval(approval_id: int, decision: str, decided_by: str = "") -> Ap
     return approval
 
 
-async def resume_after_approval(approval: ApprovalRequest) -> TeamResult:
+async def resume_after_approval(approval: ApprovalRequest, user_id: int | str) -> TeamResult:
     """Resume team execution after an approval is granted."""
     team = approval.team
     agents_with_meta = await get_team_agents_with_meta(team)
@@ -499,8 +510,8 @@ async def resume_after_approval(approval: ApprovalRequest) -> TeamResult:
             f"사용자 요청: {approval.prompt}"
         )
 
-        output = await run_claude(
-            agent, full_prompt,
+        output, _ = await execute_agent(
+            agent, full_prompt, user_id,
             platform=approval.platform, team_run_id=approval.team_run_id,
         )
         accumulated_context = output
