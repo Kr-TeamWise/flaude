@@ -10,12 +10,13 @@ Requires:
 
 Features:
     - @agent_name message — Natural message routing
-    - Thread-based session continuity
+    - Thread-based session continuity (SDK session resume)
     - /agents, /teams, /status, /history, /client, /link, /help
     - /approve, /reject, /approvals, /schedule
 """
 
 import asyncio
+import json
 import os
 import logging
 
@@ -27,7 +28,7 @@ from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
 from agents.models import Agent, AgentTeam, Client, UserPlatformLink, ThreadMessage
 from agents.orchestrator import (
-    run_claude, run_team, get_team_agents_with_meta,
+    execute_agent, run_team, get_team_agents_with_meta,
     get_running_executions, get_execution_history,
     get_pending_approvals, decide_approval, resume_after_approval,
 )
@@ -136,13 +137,15 @@ def save_client_to_db(parsed: dict, workspace_id: int | None) -> None:
 # ── Session tracking ─────────────────────────────────────────
 
 _thread_agents: dict[str, str] = {}
+_thread_sessions: dict[str, str] = {}  # thread_ts → sdk_session_id
 
 
 @sync_to_async
-def _save_thread_msg(platform: str, thread_id: str, agent_name: str, role: str, content: str):
+def _save_thread_msg(platform: str, thread_id: str, agent_name: str, role: str, content: str, sdk_session_id: str = ""):
     ThreadMessage.objects.create(
         platform=platform, thread_id=thread_id,
         agent_name=agent_name, role=role, content=content[:1000],
+        sdk_session_id=sdk_session_id,
     )
     # Keep only last 20 per thread
     ids = list(
@@ -154,14 +157,6 @@ def _save_thread_msg(platform: str, thread_id: str, agent_name: str, role: str, 
 
 
 @sync_to_async
-def _get_thread_history(platform: str, thread_id: str) -> list[dict]:
-    msgs = ThreadMessage.objects.filter(
-        platform=platform, thread_id=thread_id
-    ).order_by("created_at")[:20]
-    return [{"role": m.role, "text": m.content} for m in msgs]
-
-
-@sync_to_async
 def _get_thread_agent(platform: str, thread_id: str) -> str | None:
     last = ThreadMessage.objects.filter(
         platform=platform, thread_id=thread_id, role="agent"
@@ -169,16 +164,13 @@ def _get_thread_agent(platform: str, thread_id: str) -> str | None:
     return last.agent_name if last else None
 
 
-async def _build_thread_prompt(platform: str, thread_id: str, new_message: str) -> str:
-    history = await _get_thread_history(platform, thread_id)
-    if not history:
-        return new_message
-    lines = ["[이전 대화]"]
-    for h in history:
-        prefix = "사용자" if h["role"] == "user" else "에이전트"
-        lines.append(f"{prefix}: {h['text']}")
-    lines.append(f"\n[새 메시지]\n{new_message}")
-    return "\n".join(lines)
+@sync_to_async
+def _get_thread_session_db(platform: str, thread_id: str) -> str | None:
+    """Get the latest SDK session_id for a thread from DB."""
+    last = ThreadMessage.objects.filter(
+        platform=platform, thread_id=thread_id, role="agent",
+    ).exclude(sdk_session_id="").order_by("-created_at").values_list("sdk_session_id", flat=True).first()
+    return last
 
 
 async def _fetch_slack_channel_context(slack_client, channel_id: str, limit: int = 15) -> str:
@@ -198,6 +190,22 @@ async def _fetch_slack_channel_context(slack_client, channel_id: str, limit: int
     except Exception as e:
         logger.warning("Failed to fetch channel context: %s", e)
         return ""
+
+
+def _slack_attachment_context(event: dict) -> str:
+    """Build a context string from Slack message file attachments."""
+    files = event.get("files", [])
+    if not files:
+        return ""
+    lines = []
+    for f in files:
+        name = f.get("name", f.get("title", "file"))
+        mimetype = f.get("mimetype", "unknown")
+        size_kb = (f.get("size", 0)) // 1024
+        # url_private_download requires bot token auth; permalink_public is accessible
+        url = f.get("permalink_public") or f.get("url_private_download") or f.get("permalink", "")
+        lines.append(f"- {name} ({mimetype}, {size_kb}KB): {url}")
+    return "\n\n[첨부 파일]\n" + "\n".join(lines) + "\n위 URL에서 파일 내용을 확인할 수 있습니다.\n"
 
 
 # ── Block Kit helpers ────────────────────────────────────────
@@ -308,7 +316,6 @@ def create_slack_app(token: str) -> AsyncApp:
         name = parsed.get("contact_name", "")
         company = parsed.get("company", "")
         display = f"{company} {name}".strip() or raw_text
-        import json
         formatted = json.dumps({k: v for k, v in parsed.items() if v}, ensure_ascii=False, indent=2)
         await client.chat_postMessage(channel=command["channel_id"], text=f"*{display}* 등록했습니다.\n```{formatted}```")
 
@@ -365,10 +372,18 @@ def create_slack_app(token: str) -> AsyncApp:
                 text=f"✅ 승인 완료! *{next_name}* 실행을 시작합니다..."
             )
 
-            team_result = await resume_after_approval(approval)
-            for r in team_result.results:
-                blocks = format_agent_response(r.agent_name, r.role, r.result)
-                await client.chat_postMessage(channel=command["channel_id"], blocks=blocks, text=f"[{r.agent_name}]\n{r.result}")
+            # Resolve user for dispatch
+            flaude_user_id = await resolve_slack_user(command.get("user_id", ""))
+            if flaude_user_id:
+                team_result = await resume_after_approval(approval, flaude_user_id)
+                for r in team_result.results:
+                    blocks = format_agent_response(r.agent_name, r.role, r.result)
+                    await client.chat_postMessage(channel=command["channel_id"], blocks=blocks, text=f"[{r.agent_name}]\n{r.result}")
+            else:
+                await client.chat_postEphemeral(
+                    channel=command["channel_id"], user=command["user_id"],
+                    text="Flaude 계정이 연결되어 있지 않습니다. `/link` 명령어로 연결해주세요.",
+                )
 
         except ApprovalRequest.DoesNotExist:
             await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="해당 승인 요청을 찾을 수 없습니다.")
@@ -482,23 +497,54 @@ def create_slack_app(token: str) -> AsyncApp:
             return
 
         user_text = event.get("text", "").strip()
-        if not user_text:
+        file_ctx = _slack_attachment_context(event)
+        if not user_text and not file_ctx:
             return
+        user_text = (user_text + file_ctx).strip()
 
         channel_id = event.get("channel", "")
         thread_ts = event.get("thread_ts")
+        slack_user_id = event.get("user", "")
 
-        # Thread follow-up: check in-memory first, then DB
+        # Thread follow-up: use SDK session resume
         if thread_ts:
             agent_name = _thread_agents.get(thread_ts) or await _get_thread_agent("slack", thread_ts)
             if agent_name:
                 _thread_agents[thread_ts] = agent_name
                 agent = await find_agent_by_name(agent_name)
                 if agent:
-                    context_prompt = await _build_thread_prompt("slack", thread_ts, user_text)
+                    flaude_user_id = await resolve_slack_user(slack_user_id)
+                    if not flaude_user_id:
+                        await client.chat_postEphemeral(
+                            channel=channel_id, user=slack_user_id,
+                            text="Flaude 계정이 연결되어 있지 않습니다. `/link` 명령어로 연결해주세요.",
+                        )
+                        return
+
+                    # Get SDK session for resume
+                    sdk_session = _thread_sessions.get(thread_ts)
+                    if not sdk_session:
+                        sdk_session = await _get_thread_session_db("slack", thread_ts)
+
+                    if sdk_session:
+                        result, new_session = await execute_agent(
+                            agent, user_text, flaude_user_id,
+                            session_id=sdk_session, resume=True,
+                            platform="slack",
+                        )
+                    else:
+                        context = await _fetch_slack_channel_context(client, channel_id)
+                        prompt = context + user_text if context else user_text
+                        result, new_session = await execute_agent(
+                            agent, prompt, flaude_user_id,
+                            platform="slack",
+                        )
+
+                    if new_session:
+                        _thread_sessions[thread_ts] = new_session
+
                     await _save_thread_msg("slack", thread_ts, agent.name, "user", user_text)
-                    result = await run_claude(agent, context_prompt, platform="slack")
-                    await _save_thread_msg("slack", thread_ts, agent.name, "agent", result)
+                    await _save_thread_msg("slack", thread_ts, agent.name, "agent", result, sdk_session_id=new_session or "")
                     blocks = format_agent_response(agent.name, agent.role, result)
                     await client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, blocks=blocks, text=f"[{agent.name}]\n{result}")
                     return
@@ -513,10 +559,21 @@ def create_slack_app(token: str) -> AsyncApp:
                 # 팀인지 확인
                 team = await find_team_by_name(target_name)
                 if team:
+                    flaude_user_id = await resolve_slack_user(slack_user_id)
+                    if not flaude_user_id:
+                        await client.chat_postEphemeral(
+                            channel=channel_id, user=slack_user_id,
+                            text="Flaude 계정이 연결되어 있지 않습니다. `/link` 명령어로 연결해주세요.",
+                        )
+                        return
+
                     agents_with_meta = await get_team_agents_with_meta(team)
                     if agents_with_meta:
                         initial = await client.chat_postMessage(channel=channel_id, text=f"*{team.name}* 팀이 작업을 시작합니다...")
-                        team_result = await run_team(team, agents_with_meta, user_message, platform="slack")
+                        team_result = await run_team(
+                            team, agents_with_meta, user_message,
+                            user_id=flaude_user_id, platform="slack",
+                        )
 
                         for r in team_result.results:
                             if r.display_mode in ("status", "intermediate"):
@@ -535,22 +592,27 @@ def create_slack_app(token: str) -> AsyncApp:
                 # 에이전트인지 확인
                 agent = await find_agent_by_name(target_name)
                 if agent:
-                    flaude_user_id = await resolve_slack_user(event.get("user", ""))
-                    result = None
-                    if flaude_user_id:
-                        from agents.dispatch import dispatch_task
-                        result = await dispatch_task(str(flaude_user_id), agent.name, user_message)
+                    flaude_user_id = await resolve_slack_user(slack_user_id)
+                    if not flaude_user_id:
+                        await client.chat_postEphemeral(
+                            channel=channel_id, user=slack_user_id,
+                            text="Flaude 계정이 연결되어 있지 않습니다. `/link` 명령어로 연결해주세요.",
+                        )
+                        return
 
-                    if not result:
-                        context = await _fetch_slack_channel_context(client, channel_id)
-                        prompt = context + user_message if context else user_message
-                        result = await run_claude(agent, prompt, platform="slack")
+                    context = await _fetch_slack_channel_context(client, channel_id)
+                    prompt = context + user_message if context else user_message
+                    result, sdk_session = await execute_agent(
+                        agent, prompt, flaude_user_id,
+                        platform="slack",
+                    )
 
-                    # 에이전트 답변을 스레드로
                     reply_ts = thread_ts or event.get("ts")
                     _thread_agents[reply_ts] = agent.name
+                    if sdk_session:
+                        _thread_sessions[reply_ts] = sdk_session
                     await _save_thread_msg("slack", reply_ts, agent.name, "user", user_message)
-                    await _save_thread_msg("slack", reply_ts, agent.name, "agent", result)
+                    await _save_thread_msg("slack", reply_ts, agent.name, "agent", result, sdk_session_id=sdk_session or "")
                     blocks = format_agent_response(agent.name, agent.role, result)
                     await client.chat_postMessage(channel=channel_id, thread_ts=reply_ts, blocks=blocks, text=f"[{agent.name}]\n{result}")
                     return
@@ -560,26 +622,51 @@ def create_slack_app(token: str) -> AsyncApp:
         if not agent:
             return
 
+        flaude_user_id = await resolve_slack_user(slack_user_id)
+        if not flaude_user_id:
+            await client.chat_postEphemeral(
+                channel=channel_id, user=slack_user_id,
+                text="Flaude 계정이 연결되어 있지 않습니다. `/link` 명령어로 연결해주세요.",
+            )
+            return
+
         reply_ts = thread_ts or event.get("ts")
+
+        # Thread follow-up with SDK session resume
         if thread_ts:
-            agent_name_ch = _thread_agents.get(thread_ts) or await _get_thread_agent("slack", thread_ts)
-            if agent_name_ch:
-                context_prompt = await _build_thread_prompt("slack", thread_ts, user_text)
-                await _save_thread_msg("slack", thread_ts, agent.name, "user", user_text)
-                result = await run_claude(agent, context_prompt, platform="slack")
-                await _save_thread_msg("slack", thread_ts, agent.name, "agent", result)
+            sdk_session = _thread_sessions.get(thread_ts)
+            if not sdk_session:
+                sdk_session = await _get_thread_session_db("slack", thread_ts)
+
+            if sdk_session:
+                result, new_session = await execute_agent(
+                    agent, user_text, flaude_user_id,
+                    session_id=sdk_session, resume=True,
+                    platform="slack",
+                )
             else:
                 context = await _fetch_slack_channel_context(client, channel_id)
                 prompt = context + user_text if context else user_text
-                result = await run_claude(agent, prompt, platform="slack")
-                await _save_thread_msg("slack", reply_ts, agent.name, "user", user_text)
-                await _save_thread_msg("slack", reply_ts, agent.name, "agent", result)
+                result, new_session = await execute_agent(
+                    agent, prompt, flaude_user_id,
+                    platform="slack",
+                )
+
+            if new_session:
+                _thread_sessions[thread_ts] = new_session
+            await _save_thread_msg("slack", thread_ts, agent.name, "user", user_text)
+            await _save_thread_msg("slack", thread_ts, agent.name, "agent", result, sdk_session_id=new_session or "")
         else:
             context = await _fetch_slack_channel_context(client, channel_id)
             prompt = context + user_text if context else user_text
-            result = await run_claude(agent, prompt, platform="slack")
+            result, sdk_session = await execute_agent(
+                agent, prompt, flaude_user_id,
+                platform="slack",
+            )
+            if sdk_session:
+                _thread_sessions[reply_ts] = sdk_session
             await _save_thread_msg("slack", reply_ts, agent.name, "user", user_text)
-            await _save_thread_msg("slack", reply_ts, agent.name, "agent", result)
+            await _save_thread_msg("slack", reply_ts, agent.name, "agent", result, sdk_session_id=sdk_session or "")
 
         blocks = format_agent_response(agent.name, agent.role, result)
         _thread_agents[reply_ts] = agent.name

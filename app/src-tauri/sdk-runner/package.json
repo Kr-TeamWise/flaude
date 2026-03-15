@@ -1,0 +1,9 @@
+{
+  "name": "flaude-sdk-runner",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest",
+    "tsx": "^4"
+  }
+}

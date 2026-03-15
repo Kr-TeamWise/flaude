@@ -91,13 +91,19 @@ async def _execute_schedule(schedule_id: int):
     from asgiref.sync import sync_to_async
     from agents.models import AgentSchedule
     from agents.orchestrator import (
-        run_claude, run_team, get_team_agents_with_meta,
+        execute_agent, run_team, get_team_agents_with_meta,
     )
     from agents.notifier import notify_schedule_result
 
     @sync_to_async
     def load_schedule(sid):
-        return AgentSchedule.objects.select_related("agent", "team", "client").get(id=sid)
+        return AgentSchedule.objects.select_related(
+            "agent", "team", "client", "agent__workspace", "team__workspace",
+        ).get(id=sid)
+
+    @sync_to_async
+    def get_workspace_owner_id(workspace):
+        return workspace.created_by_id
 
     @sync_to_async
     def update_last_run(sched):
@@ -110,12 +116,19 @@ async def _execute_schedule(schedule_id: int):
         logger.error("Schedule %d not found", schedule_id)
         return
 
+    # Resolve workspace owner as the user for dispatch
+    workspace = sched.agent.workspace if sched.agent else (sched.team.workspace if sched.team else None)
+    if not workspace:
+        logger.warning("Schedule %d has no workspace", schedule_id)
+        return
+    user_id = await get_workspace_owner_id(workspace)
+
     logger.info("Executing schedule: %s", sched.name)
 
     try:
         if sched.agent:
-            result = await run_claude(
-                sched.agent, sched.prompt,
+            result, _ = await execute_agent(
+                sched.agent, sched.prompt, user_id,
                 platform="scheduler",
                 client=sched.client,
             )
@@ -124,6 +137,7 @@ async def _execute_schedule(schedule_id: int):
             agents_with_meta = await get_team_agents_with_meta(sched.team)
             team_result = await run_team(
                 sched.team, agents_with_meta, sched.prompt,
+                user_id=user_id,
                 platform="scheduler", client=sched.client,
             )
             # Combine results

@@ -69,13 +69,16 @@ class Agent(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     fired_at = models.DateTimeField(null=True, blank=True)
 
+    class Meta:
+        unique_together = [("workspace", "name")]
+
     def __str__(self):
         return f"{self.name} ({self.role})"
 
 
 class AgentTeam(models.Model):
     workspace = models.ForeignKey(Workspace, on_delete=models.CASCADE, related_name="agent_teams")
-    name = models.CharField(max_length=100)
+    name = models.CharField(max_length=100, unique=True)
     members = models.JSONField(default=list)
     execution_mode = models.CharField(max_length=20, default="sequential", choices=[("sequential", "Sequential"), ("parallel", "Parallel")])
     created_at = models.DateTimeField(auto_now_add=True)
@@ -157,6 +160,9 @@ class ExecutionLog(models.Model):
     ])
     duration_ms = models.IntegerField(null=True, blank=True)
     session_id = models.CharField(max_length=100, blank=True)
+    sdk_session_id = models.CharField(max_length=100, blank=True, default="")
+    cost_usd = models.FloatField(null=True, blank=True)
+    num_turns = models.IntegerField(null=True, blank=True)
     team_run_id = models.CharField(max_length=100, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -252,6 +258,7 @@ class ThreadMessage(models.Model):
     agent_name = models.CharField(max_length=100)
     role = models.CharField(max_length=10)  # "user" or "agent"
     content = models.TextField()
+    sdk_session_id = models.CharField(max_length=100, blank=True, default="", db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

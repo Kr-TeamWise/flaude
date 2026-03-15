@@ -1,7 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import "./App.css";
 import {
   type Agent,
@@ -56,17 +61,24 @@ import {
   authGooglePoll,
   setAuthToken,
   getAuthToken,
+  SERVER_URL,
 } from "./api";
 import {
   SKILL_LIBRARY,
   SKILL_CATEGORIES,
   INTEGRATIONS,
-  BUILT_IN_TOOLS,
+  // BUILT_IN_TOOLS,
   mergeSkills,
   toolLabel,
   cronLabel,
   SCHEDULE_PRESETS,
+  PERMISSION_GROUPS,
+  permissionGroupsToSdkTools,
+  sdkToolsToPermissionGroups,
+  permissionGroupsToDisallowed,
+  buildGwsRestrictions,
   type Skill,
+  // type PermissionGroup,
 } from "./skills";
 import { createT, type Lang } from "./i18n";
 import { AGENT_TEMPLATES, type AgentTemplate } from "./templates";
@@ -75,7 +87,7 @@ import { AGENT_TEMPLATES, type AgentTemplate } from "./templates";
 
 // Moved to inside App component to be reactive to enabledIntegrations
 
-type Page = "agents" | "teams" | "clients" | "settings";
+type Page = "chat" | "agents" | "teams" | "clients" | "settings";
 
 // ── Integration Logos (inline SVG) ──────────────────
 
@@ -122,44 +134,57 @@ function IntegrationLogo({ id, size = 20 }: { id: string; size?: number }) {
   }
 }
 
-// ── Tag Selector ────────────────────────────────────
+// ── Permission Selector (user-friendly) ─────────────
 
-function TagSelector({
+function PermissionSelector({
   label,
   hint,
-  available,
   selected,
   onChange,
   lang,
+  hasGws,
 }: {
   label: string;
   hint?: string;
-  available: string[];
   selected: string[];
-  onChange: (t: string[]) => void;
+  onChange: (ids: string[]) => void;
   lang: "ko" | "en";
+  hasGws: boolean;
 }) {
-  const toggle = (tag: string) =>
-    onChange(selected.includes(tag) ? selected.filter((t) => t !== tag) : [...selected, tag]);
+  const toggle = (id: string) =>
+    onChange(selected.includes(id) ? selected.filter((g) => g !== id) : [...selected, id]);
+  const groups = PERMISSION_GROUPS.filter((g) => !g.requiresGws || hasGws);
+
   return (
     <div>
-      <label className="text-xs font-medium text-[#6B7280] block mb-1">{label}</label>
-      {hint && <p className="text-[10px] text-[#9CA3AF] mb-1.5">{hint}</p>}
-      <div className="flex flex-wrap gap-1">
-        {available.map((tag) => (
-          <button
-            key={tag}
-            type="button"
-            onClick={() => toggle(tag)}
-            className={`px-2 py-0.5 text-[11px] rounded-full border transition ${
-              selected.includes(tag)
-                ? "bg-[#D97706]/10 text-[#D97706] border-[#D97706]/30"
-                : "bg-gray-50 text-gray-500 border-gray-200 hover:bg-gray-100"
-            }`}
-          >
-            {toolLabel(tag, lang)}
-          </button>
-        ))}
+      <label className="text-xs font-medium text-[#6B7280] block mb-1.5">{label}</label>
+      {hint && <p className="text-[10px] text-[#9CA3AF] mb-2">{hint}</p>}
+      <div className="grid grid-cols-2 gap-1.5">
+        {groups.map((g) => {
+          const on = selected.includes(g.id);
+          return (
+            <button
+              key={g.id}
+              type="button"
+              onClick={() => toggle(g.id)}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-left transition ${
+                on
+                  ? "bg-[#D97706]/5 border-[#D97706]/30"
+                  : "bg-gray-50 border-gray-200 hover:bg-gray-100"
+              }`}
+            >
+              <div className={`w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 ${
+                on ? "bg-[#D97706] border-[#D97706]" : "border-gray-300"
+              }`}>
+                {on && <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3"><polyline points="20 6 9 17 4 12"/></svg>}
+              </div>
+              <div className="min-w-0">
+                <div className="text-[12px] font-medium text-[#374151]">{g[lang]}</div>
+                <div className="text-[10px] text-[#9CA3AF] truncate">{g.description[lang]}</div>
+              </div>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -221,6 +246,43 @@ function App() {
   );
   const t = createT(lang);
 
+  // Update state
+  const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body: string } | null>(null);
+  const [updating, setUpdating] = useState(false);
+
+  useEffect(() => {
+    // Check for updates on launch (skip in dev)
+    if (window.location.hostname === "localhost") return;
+    const checkUpdate = async () => {
+      try {
+        const update = await check();
+        if (update) {
+          setUpdateAvailable({ version: update.version, body: update.body || "" });
+        }
+      } catch {
+        // Silently ignore update check failures
+      }
+    };
+    checkUpdate();
+    // Re-check every 30 minutes
+    const interval = setInterval(checkUpdate, 30 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleUpdate = async () => {
+    setUpdating(true);
+    try {
+      const update = await check();
+      if (update) {
+        await update.downloadAndInstall();
+        await relaunch();
+      }
+    } catch (e) {
+      console.error("Update failed:", e);
+      setUpdating(false);
+    }
+  };
+
   // Auth state
   const [authUser, setAuthUser] = useState<{ email: string; name: string } | null>(() => {
     try { const s = localStorage.getItem("flaude_user"); return s ? JSON.parse(s) : null; } catch { return null; }
@@ -228,6 +290,31 @@ function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(() => !!getAuthToken());
   const [loginError, setLoginError] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [wsError, setWsError] = useState<string | null>(null);
+
+  // Connect WebSocket to server for Discord dispatch
+  const connectWebSocket = async (token?: string) => {
+    const t = token || getAuthToken();
+    if (!t) { setWsError("No auth token"); return; }
+    try {
+      setWsError(null);
+      await invoke<string>("ws_connect", { serverUrl: SERVER_URL, token: t });
+      setWsConnected(true);
+      setWsError(null);
+    } catch (e) {
+      console.error("WebSocket connection failed:", e);
+      setWsError(String(e));
+      setWsConnected(false);
+    }
+  };
+
+  // Auto-connect on app start if already logged in
+  useEffect(() => {
+    if (isLoggedIn) {
+      connectWebSocket();
+    }
+  }, [isLoggedIn]);
 
   const handleGoogleLogin = async () => {
     try {
@@ -254,6 +341,8 @@ function App() {
             localStorage.setItem("flaude_user", JSON.stringify(user));
             setIsLoggedIn(true);
             setLoginLoading(false);
+            // Connect WebSocket for Discord dispatch
+            connectWebSocket(result.token);
             // Bring app window to front
             try { await getCurrentWindow().setFocus(); } catch {}
           }
@@ -289,7 +378,7 @@ function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [agentTeams, setAgentTeams] = useState<AgentTeam[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
-  const [currentPage, setCurrentPage] = useState<Page>("agents");
+  const [currentPage, setCurrentPage] = useState<Page>("chat");
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
   const [prompt, setPrompt] = useState("");
   const [runningAgents, setRunningAgents] = useState<Record<number, boolean>>({});
@@ -304,19 +393,24 @@ function App() {
   const [agentFormRole, setAgentFormRole] = useState("");
   const [agentFormInstructions, setAgentFormInstructions] = useState("");
   const [agentFormTools, setAgentFormTools] = useState<string[]>([]);
-  const [agentFormNotAllowed, setAgentFormNotAllowed] = useState<string[]>([]);
+  const [, setAgentFormNotAllowed] = useState<string[]>([]);
+  // Permission group IDs for user-friendly UI
+  const [agentFormPermissions, setAgentFormPermissions] = useState<string[]>(["web-research", "file-access", "run-commands"]);
+  const [agentFormDenied, setAgentFormDenied] = useState<string[]>([]);
   const [agentFormSkills, setAgentFormSkills] = useState<string[]>([]);
   const [agentFormChannels, setAgentFormChannels] = useState("");
+  const [agentFormReduceHallucinations, setAgentFormReduceHallucinations] = useState(false);
+  const [agentFormMaxTurns, setAgentFormMaxTurns] = useState<string>("");
+  const [agentFormMaxBudget, setAgentFormMaxBudget] = useState<string>("");
+  const [agentFormEffort, setAgentFormEffort] = useState<"" | "low" | "medium" | "high">("");
   const [skillCategory, setSkillCategory] = useState("all");
   const [showSkillBrowser, setShowSkillBrowser] = useState(false);
 
   // Team form
   const [showTeamForm, setShowTeamForm] = useState(false);
   const [teamFormName, setTeamFormName] = useState("");
-  const [teamFormMode, setTeamFormMode] = useState<"sequential" | "parallel">("sequential");
   const [teamFormMembers, setTeamFormMembers] = useState<number[]>([]);
   const [teamFormLead, setTeamFormLead] = useState<number | null>(null);
-  const [teamFormConditions, setTeamFormConditions] = useState<Record<number, string>>({});
   const [teamFormApprovals, setTeamFormApprovals] = useState<Record<number, boolean>>({});
 
   // Client
@@ -354,25 +448,359 @@ function App() {
       return saved ? JSON.parse(saved) : ["gws"];
     } catch { return ["gws"]; }
   });
-
-  // Dynamic tools based on enabled integrations
-  const ALL_TOOLS = useMemo(() => [
-    ...BUILT_IN_TOOLS,
-    ...INTEGRATIONS.filter((i) => enabledIntegrations.includes(i.id)).flatMap((i) => i.tools),
-  ].filter((v, i, a) => a.indexOf(v) === i), [enabledIntegrations]);
-
-  // Chat: per-agent message history + session (persisted)
-  type ChatMsg = { role: "user" | "agent"; text: string };
-  const [agentChats, setAgentChats] = useState<Record<number, ChatMsg[]>>(() => {
-    try { return JSON.parse(localStorage.getItem("flaude_chats") || "{}"); } catch { return {}; }
+  type DriveFolder = { label: string; folderId: string; driveId?: string };
+  const [driveFolders, setDriveFolders] = useState<DriveFolder[]>(() => {
+    try { return JSON.parse(localStorage.getItem("flaude_drive_folders") || "[]"); } catch { return []; }
   });
-  const [agentSessions, setAgentSessions] = useState<Record<number, string>>(() => {
-    try { return JSON.parse(localStorage.getItem("flaude_sessions") || "{}"); } catch { return {}; }
-  });
+  useEffect(() => { localStorage.setItem("flaude_drive_folders", JSON.stringify(driveFolders)); }, [driveFolders]);
 
-  // Persist chats & sessions
-  useEffect(() => { localStorage.setItem("flaude_chats", JSON.stringify(agentChats)); }, [agentChats]);
-  useEffect(() => { localStorage.setItem("flaude_sessions", JSON.stringify(agentSessions)); }, [agentSessions]);
+  // Default file save path
+  const [defaultSavePath, setDefaultSavePath] = useState(() => localStorage.getItem("flaude_save_path") || "");
+  useEffect(() => { localStorage.setItem("flaude_save_path", defaultSavePath); }, [defaultSavePath]);
+
+  // Per-agent advanced settings (stored locally)
+  type AgentAdvSettings = { reduceHallucinations?: boolean; maxTurns?: number; maxBudgetUsd?: number; effort?: "low" | "medium" | "high" };
+  const [agentAdvSettings, setAgentAdvSettings] = useState<Record<number, AgentAdvSettings>>(() => {
+    try { return JSON.parse(localStorage.getItem("flaude_agent_adv") || "{}"); } catch { return {}; }
+  });
+  useEffect(() => { localStorage.setItem("flaude_agent_adv", JSON.stringify(agentAdvSettings)); }, [agentAdvSettings]);
+
+  // Chat: unified conversations stored locally
+  type ChatMsg = { role: "user" | "agent" | "system"; text: string; agentName?: string; files?: string[]; ts?: number; error?: boolean };
+  type Conversation = { id: string; title: string; messages: ChatMsg[]; sessions: Record<number, string>; createdAt: number; lastAgentId?: number };
+
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeConvoId, setActiveConvoId] = useState<string | null>(null);
+  const [chatRunningAgent, setChatRunningAgent] = useState<string | null>(null);
+  const streamTargetTsRef = useRef<number>(0); // current streaming message timestamp
+  const streamRunningAgentRef = useRef<string | null>(null); // agent name for new interject placeholders
+  const [chatFiles, setChatFiles] = useState<{ name: string; path: string }[]>([]);
+  const [showMentionPicker, setShowMentionPicker] = useState(false);
+  const [mentionFilter, setMentionFilter] = useState("");
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [dataDir, setDataDir] = useState("");
+  const [chatDataLoaded, setChatDataLoaded] = useState(false);
+
+  // Legacy per-agent chats (used in agents page inline chat)
+  const [agentChats, setAgentChats] = useState<Record<number, ChatMsg[]>>({});
+  const [agentSessions, setAgentSessions] = useState<Record<number, string>>({});
+
+  // Load chat data from file storage on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const [convosRaw, activeRaw, chatsRaw, sessionsRaw, dirPath] = await Promise.all([
+          invoke<string>("read_data", { key: "conversations" }),
+          invoke<string>("read_data", { key: "active_convo" }),
+          invoke<string>("read_data", { key: "agent_chats" }),
+          invoke<string>("read_data", { key: "agent_sessions" }),
+          invoke<string>("get_data_path"),
+        ]);
+        if (convosRaw && convosRaw !== "null") setConversations(JSON.parse(convosRaw));
+        if (activeRaw && activeRaw !== "null") setActiveConvoId(JSON.parse(activeRaw));
+        if (chatsRaw && chatsRaw !== "null") setAgentChats(JSON.parse(chatsRaw));
+        if (sessionsRaw && sessionsRaw !== "null") setAgentSessions(JSON.parse(sessionsRaw));
+        setDataDir(dirPath);
+      } catch {
+        // Fallback: migrate from localStorage if file storage fails
+        try {
+          const lc = localStorage.getItem("flaude_convos");
+          if (lc) setConversations(JSON.parse(lc));
+          const la = localStorage.getItem("flaude_active_convo");
+          if (la) setActiveConvoId(la);
+        } catch { /* ignore */ }
+      } finally {
+        setChatDataLoaded(true);
+      }
+    })();
+  }, []);
+
+  const activeConvo = conversations.find((c) => c.id === activeConvoId) || null;
+  const chatMessages = activeConvo?.messages || [];
+
+  const updateConvo = useCallback((id: string, updater: (c: Conversation) => Conversation) => {
+    setConversations((prev) => prev.map((c) => c.id === id ? updater(c) : c));
+  }, []);
+
+  const createConvo = useCallback(() => {
+    const id = `conv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const convo: Conversation = { id, title: lang === "ko" ? "새 대화" : "New chat", messages: [], sessions: {}, createdAt: Date.now() };
+    setConversations((prev) => [convo, ...prev]);
+    setActiveConvoId(id);
+    setChatFiles([]);
+    return id;
+  }, [lang]);
+
+  // Persist conversations to file storage (only after initial load completes)
+  useEffect(() => { if (chatDataLoaded) invoke("write_data", { key: "conversations", value: JSON.stringify(conversations) }).catch(() => {}); }, [conversations, chatDataLoaded]);
+  useEffect(() => { if (chatDataLoaded) invoke("write_data", { key: "active_convo", value: JSON.stringify(activeConvoId) }).catch(() => {}); }, [activeConvoId, chatDataLoaded]);
+  useEffect(() => { if (chatDataLoaded) invoke("write_data", { key: "agent_chats", value: JSON.stringify(agentChats) }).catch(() => {}); }, [agentChats, chatDataLoaded]);
+  useEffect(() => { if (chatDataLoaded) invoke("write_data", { key: "agent_sessions", value: JSON.stringify(agentSessions) }).catch(() => {}); }, [agentSessions, chatDataLoaded]);
+
+  // ── Knowledge Memory (local knowledge graph) ──
+  type MemoryNode = {
+    id: string;
+    category: "client" | "project" | "person" | "decision" | "fact";
+    subject: string;
+    content: string;
+    source: string; // conversation title / agent name
+    createdAt: number;
+    relations?: string[]; // IDs of related nodes
+  };
+  const [knowledgeMemory, setKnowledgeMemory] = useState<MemoryNode[]>([]);
+  const [memoryLoaded, setMemoryLoaded] = useState(false);
+  const [memoryEnabled, setMemoryEnabled] = useState(() => localStorage.getItem("flaude_memory_enabled") !== "false");
+
+  // Load knowledge memory from file storage
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await invoke<string>("read_data", { key: "knowledge_memory" });
+        if (raw && raw !== "null") setKnowledgeMemory(JSON.parse(raw));
+      } catch { /* ignore */ }
+      setMemoryLoaded(true);
+    })();
+  }, []);
+
+  // Persist knowledge memory
+  useEffect(() => {
+    if (memoryLoaded) invoke("write_data", { key: "knowledge_memory", value: JSON.stringify(knowledgeMemory) }).catch(() => {});
+  }, [knowledgeMemory, memoryLoaded]);
+  useEffect(() => { localStorage.setItem("flaude_memory_enabled", memoryEnabled ? "true" : "false"); }, [memoryEnabled]);
+
+  // Extract memories from a conversation turn (runs in background, no latency)
+  const extractMemories = useCallback(async (userMsg: string, agentResponse: string, agentName: string, convoTitle: string) => {
+    if (!memoryEnabled) return;
+    // Don't extract from error responses or very short ones
+    if (agentResponse.length < 50 || agentResponse.startsWith("Error")) return;
+
+    try {
+      // Build existing memory context for dedup + relation linking
+      const existingSubjects = knowledgeMemory.slice(-20).map((m) => m.subject);
+      const existingCtx = existingSubjects.length > 0
+        ? `\n\n이미 저장된 기억 (중복 금지, 관계 연결에 활용):\n${existingSubjects.map((s) => `- ${s}`).join("\n")}`
+        : "";
+
+      const extractionPrompt = `아래 대화에서 장기적으로 기억할 가치가 있는 핵심 정보를 지식 그래프 노드로 추출하세요.
+
+## 추출 기준
+✅ 추출 대상:
+- 고객/회사 정보 (이름, 연락처, 업종, 히스토리)
+- 프로젝트 결정사항, 마일스톤, 일정
+- 중요 인물과 역할 관계
+- 비즈니스 수치, KPI, 예산
+- 기술적 결정이나 아키텍처 선택
+
+❌ 추출 금지:
+- 일반 대화, 인사, 단순 질문/답변
+- 이미 알려진 상식이나 일반 지식
+- 코드 스니펫이나 구현 세부사항
+- 이미 저장된 정보와 동일한 내용
+
+## 관계(relations) 작성 규칙
+- 이미 저장된 기억의 subject와 연결될 수 있으면 해당 subject를 relations에 포함
+- 같은 추출 결과 내 다른 노드와도 연결
+- 관계는 구체적 키워드로 (예: "삼성전자", "2024 리뉴얼 프로젝트")
+${existingCtx}
+
+## 응답 형식 (JSON만, 다른 텍스트 금지)
+추출할 게 없으면: []
+있으면:
+[{"category":"client|project|person|decision|fact","subject":"고유하고 구체적인 제목","content":"맥락이 담긴 1~2문장 설명","relations":["관련_subject_또는_키워드"]}]
+
+---
+대화:
+사용자: ${userMsg.slice(0, 800)}
+${agentName}: ${agentResponse.slice(0, 2000)}`;
+
+      const raw = await invoke<string>("run_agent", {
+        prompt: extractionPrompt,
+        instructions: "너는 지식 그래프 빌더다. 대화에서 장기 기억할 정보를 JSON 노드로 추출한다. 도구를 절대 사용하지 마라. JSON 배열만 반환하라.",
+        allowedTools: "",
+        disallowedTools: null,
+        sessionId: null,
+        continueSession: null,
+        agents: null,
+        enableCheckpointing: false,
+        cwd: null,
+        maxTurns: 1,
+        maxBudgetUsd: null,
+        effort: "medium",
+        model: "sonnet",
+      });
+
+      const parsed = JSON.parse(raw);
+      const result = parsed.result || raw;
+      // Try to extract JSON array from the result
+      const jsonMatch = result.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) return;
+      const items: Array<{ category: string; subject: string; content: string; relations?: string[] }> = JSON.parse(jsonMatch[0]);
+      if (!Array.isArray(items) || items.length === 0) return;
+
+      const newNodes: MemoryNode[] = items
+        .filter((item) => item.subject && item.content && ["client", "project", "person", "decision", "fact"].includes(item.category))
+        .slice(0, 5) // Max 5 per turn — sonnet is better at quality filtering
+        .map((item) => ({
+          id: `mem_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          category: item.category as MemoryNode["category"],
+          subject: item.subject,
+          content: item.content,
+          source: `${agentName} · ${convoTitle}`,
+          createdAt: Date.now(),
+          relations: item.relations,
+        }));
+
+      if (newNodes.length > 0) {
+        // Deduplicate: skip if same subject already exists
+        setKnowledgeMemory((prev) => {
+          const existing = new Set(prev.map((n) => n.subject));
+          const unique = newNodes.filter((n) => !existing.has(n.subject));
+          return unique.length > 0 ? [...prev, ...unique] : prev;
+        });
+      }
+    } catch {
+      // Silent fail — memory extraction is best-effort
+    }
+  }, [memoryEnabled, knowledgeMemory]);
+
+  // Auto-scroll on new messages
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatMessages, chatRunningAgent]);
+
+  // Cmd+N for new conversation
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "n" && currentPage === "chat") {
+        e.preventDefault();
+        createConvo();
+        chatInputRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [currentPage, createConvo]);
+
+  const [convoSearch, setConvoSearch] = useState("");
+  const [copiedMsgIdx, setCopiedMsgIdx] = useState<number | null>(null);
+
+  const copyMessage = (text: string, idx: number) => {
+    navigator.clipboard.writeText(text);
+    setCopiedMsgIdx(idx);
+    setTimeout(() => setCopiedMsgIdx(null), 1500);
+  };
+
+  // ── Confidence badge rendering ──
+  // Problem: ReactMarkdown parses [확인됨] as markdown link syntax.
+  // Solution: Pre-process text BEFORE markdown parsing to replace badges
+  // with inline code markers that markdown won't touch, then render them
+  // as React components via the `code` handler.
+  const BADGE_TOKEN = "::badge::";
+  const BADGE_MAP: Record<string, { style: string; label: string; icon: string }> = {
+    confirmed: { style: "bg-emerald-50 text-emerald-700 border-emerald-200", label: lang === "ko" ? "확인됨" : "Verified", icon: "\u2713" },
+    estimated: { style: "bg-amber-50 text-amber-700 border-amber-200", label: lang === "ko" ? "추정" : "Estimated", icon: "~" },
+    unverified: { style: "bg-red-50 text-red-600 border-red-200", label: lang === "ko" ? "미확인" : "Unverified", icon: "?" },
+    "no-source": { style: "bg-gray-100 text-gray-500 border-gray-200", label: lang === "ko" ? "출처 미확인" : "No Source", icon: "\u2014" },
+  };
+
+  const ConfidenceBadge = ({ type }: { type: string }) => {
+    const b = BADGE_MAP[type];
+    if (!b) return <code>{type}</code>;
+    return (
+      <span className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-medium rounded-full border ${b.style} align-middle mx-0.5 not-prose`}>
+        <span className="text-[9px]">{b.icon}</span>{b.label}
+      </span>
+    );
+  };
+
+  /** Pre-process markdown text: convert [확인됨] etc to backtick-wrapped tokens
+   *  that ReactMarkdown will treat as inline code, then we intercept in the `code` renderer. */
+  const preprocessBadges = (text: string): string => {
+    return text
+      .replace(/\[출처 미확인\]/g, `\`${BADGE_TOKEN}no-source\``)
+      .replace(/\[확인됨\]/g, `\`${BADGE_TOKEN}confirmed\``)
+      .replace(/\[추정\]/g, `\`${BADGE_TOKEN}estimated\``)
+      .replace(/\[미확인\]/g, `\`${BADGE_TOKEN}unverified\``);
+  };
+
+  const MarkdownMessage = ({ text }: { text: string }) => (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        h1: ({ children }) => <h1 className="text-base font-bold mt-3 mb-1.5 first:mt-0">{children}</h1>,
+        h2: ({ children }) => <h2 className="text-[15px] font-bold mt-3 mb-1 first:mt-0">{children}</h2>,
+        h3: ({ children }) => <h3 className="text-sm font-semibold mt-2.5 mb-1 first:mt-0">{children}</h3>,
+        h4: ({ children }) => <h4 className="text-sm font-semibold mt-2 mb-0.5 first:mt-0">{children}</h4>,
+        p: ({ children }) => <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>,
+        ul: ({ children }) => <ul className="mb-2 last:mb-0 pl-4 space-y-0.5 list-disc">{children}</ul>,
+        ol: ({ children }) => <ol className="mb-2 last:mb-0 pl-4 space-y-0.5 list-decimal">{children}</ol>,
+        li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+        strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+        em: ({ children }) => <em className="italic">{children}</em>,
+        a: ({ href, children }) => {
+          // Style source/citation links with a special pill look
+          const isSource = href && (href.startsWith("http") || href.startsWith("https"));
+          const childText = typeof children === "string" ? children : Array.isArray(children) ? children.join("") : "";
+          const isFootnote = /^\d+$/.test(childText) || /^출처/.test(childText) || /^source/i.test(childText);
+          if (isSource && isFootnote) {
+            return (
+              <a href={href} onClick={(e) => { e.preventDefault(); openUrl(href!); }} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] text-[#D97706] bg-[#D97706]/5 rounded-full border border-[#D97706]/20 hover:bg-[#D97706]/10 cursor-pointer align-middle mx-0.5 no-underline font-medium" title={href}>
+                <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                {children}
+              </a>
+            );
+          }
+          return (
+            <a href={href} onClick={(e) => { e.preventDefault(); if (href) openUrl(href); }} className="text-[#D97706] underline underline-offset-2 hover:text-[#B45309] cursor-pointer">
+              {children}
+            </a>
+          );
+        },
+        blockquote: ({ children }) => (
+          <blockquote className="border-l-[3px] border-[#D97706]/40 pl-3 my-2 text-[#6B7280] italic">{children}</blockquote>
+        ),
+        hr: () => <hr className="my-3 border-gray-200" />,
+        code: ({ className, children, ...props }) => {
+          // Intercept badge tokens
+          const childStr = typeof children === "string" ? children : "";
+          if (childStr.startsWith(BADGE_TOKEN)) {
+            const type = childStr.slice(BADGE_TOKEN.length);
+            return <ConfidenceBadge type={type} />;
+          }
+          const isBlock = className?.includes("language-");
+          if (isBlock) {
+            const langName = className?.replace("language-", "") || "";
+            return (
+              <div className="my-2 rounded-lg overflow-hidden bg-[#1A1A1A]">
+                {langName && <div className="px-3 pt-2 text-[10px] text-[#6B7280] font-mono">{langName}</div>}
+                <pre className="p-3 pt-1.5 overflow-x-auto text-xs">
+                  <code className="text-[#E5E5E5] font-mono" {...props}>{children}</code>
+                </pre>
+              </div>
+            );
+          }
+          return <code className="px-1 py-0.5 bg-gray-100 text-[#D97706] rounded text-xs font-mono" {...props}>{children}</code>;
+        },
+        pre: ({ children }) => <>{children}</>,
+        table: ({ children }) => (
+          <div className="my-2 overflow-x-auto rounded-lg border border-gray-200">
+            <table className="min-w-full text-xs">{children}</table>
+          </div>
+        ),
+        thead: ({ children }) => <thead className="bg-gray-50 border-b border-gray-200">{children}</thead>,
+        th: ({ children }) => <th className="px-3 py-1.5 text-left font-semibold text-[#374151]">{children}</th>,
+        td: ({ children }) => <td className="px-3 py-1.5 border-t border-gray-100">{children}</td>,
+        input: ({ checked, ...props }) => (
+          <input type="checkbox" checked={checked} readOnly className="mr-1.5 accent-[#D97706]" {...props} />
+        ),
+      }}
+    >
+      {preprocessBadges(text)}
+    </ReactMarkdown>
+  );
+
+  // Used in history dropdown (filtered inline)
 
   // Team run — chat style
   const [teamPrompt, setTeamPrompt] = useState("");
@@ -385,7 +813,7 @@ function App() {
   useEffect(() => { localStorage.setItem("flaude_team_chats", JSON.stringify(teamChats)); }, [teamChats]);
 
   // Integration setup
-  const [integrationStatus, setIntegrationStatus] = useState<Record<string, string>>({});
+  const [, setIntegrationStatus] = useState<Record<string, string>>({});
   const [setupLog, setSetupLog] = useState("");
   const [settingUp, setSettingUp] = useState<string | null>(null);
 
@@ -397,7 +825,7 @@ function App() {
   // Schedules
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [showScheduleForm, setShowScheduleForm] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<"general" | "integrations" | "automation" | "team">("general");
+  const [settingsTab, setSettingsTab] = useState<"general" | "integrations" | "automation" | "team" | "memory">("general");
   const [scheduleForm, setScheduleForm] = useState({
     name: "", agent_id: null as number | null, team_id: null as number | null,
     cron_expression: "", prompt: "", notification_channel: "",
@@ -522,8 +950,14 @@ function App() {
     setAgentFormInstructions("");
     setAgentFormTools([]);
     setAgentFormNotAllowed([]);
+    setAgentFormPermissions(["web-research", "file-access", "run-commands"]);
+    setAgentFormDenied([]);
     setAgentFormSkills([]);
     setAgentFormChannels("");
+    setAgentFormReduceHallucinations(false);
+    setAgentFormMaxTurns("");
+    setAgentFormMaxBudget("");
+    setAgentFormEffort("");
     setShowSkillBrowser(false);
     setSkillCategory("all");
   };
@@ -541,6 +975,8 @@ function App() {
     setAgentFormInstructions(tpl.instructions);
     setAgentFormTools([...tpl.tools]);
     setAgentFormNotAllowed([...tpl.not_allowed]);
+    setAgentFormPermissions(sdkToolsToPermissionGroups(tpl.tools, enabledIntegrations.includes("gws")));
+    setAgentFormDenied([]);
     setHireMode("custom"); // switch to form view with pre-filled data
   };
 
@@ -558,8 +994,15 @@ function App() {
     setAgentFormInstructions(agent.instructions);
     setAgentFormTools([...agent.tools]);
     setAgentFormNotAllowed([...agent.not_allowed]);
+    setAgentFormPermissions(sdkToolsToPermissionGroups(agent.tools, enabledIntegrations.includes("gws")));
+    setAgentFormDenied([]);
     setAgentFormSkills([]);
     setAgentFormChannels((agent.channels || []).join(", "));
+    const adv = agentAdvSettings[agent.id] || {};
+    setAgentFormReduceHallucinations(adv.reduceHallucinations || false);
+    setAgentFormMaxTurns(adv.maxTurns != null ? String(adv.maxTurns) : "");
+    setAgentFormMaxBudget(adv.maxBudgetUsd != null ? String(adv.maxBudgetUsd) : "");
+    setAgentFormEffort(adv.effort || "");
     setShowAgentForm(true);
     setHireMode("edit");
     setShowSkillBrowser(false);
@@ -575,6 +1018,8 @@ function App() {
     setAgentFormInstructions(merged.instructions);
     setAgentFormTools(merged.tools);
     setAgentFormNotAllowed(merged.not_allowed);
+    setAgentFormPermissions(sdkToolsToPermissionGroups(merged.tools, enabledIntegrations.includes("gws")));
+    setAgentFormDenied([]);
     // Auto-set role from first skill
     if (next.length > 0) {
       const first = SKILL_LIBRARY.find((s) => s.id === next[0]);
@@ -589,18 +1034,34 @@ function App() {
         .split(",")
         .map((c) => c.trim())
         .filter(Boolean);
+      const resolvedTools = permissionGroupsToSdkTools(agentFormPermissions);
+      const resolvedDenied = permissionGroupsToDisallowed(agentFormDenied);
+      const gwsRestrictions = buildGwsRestrictions(agentFormDenied, lang);
+      const finalInstructions = agentFormInstructions + gwsRestrictions;
       const data = {
         name: agentFormName,
         role: agentFormRole,
-        instructions: agentFormInstructions,
-        tools: agentFormTools,
-        not_allowed: agentFormNotAllowed,
+        instructions: finalInstructions,
+        tools: resolvedTools,
+        not_allowed: resolvedDenied,
         channels,
       };
+      let savedId: number;
       if (editingAgentId) {
         await updateAgent(editingAgentId, data);
+        savedId = editingAgentId;
       } else {
-        await createAgent(workspaceId, data);
+        const created = await createAgent(workspaceId, data);
+        savedId = created?.id || 0;
+      }
+      // Save advanced settings locally
+      if (savedId) {
+        const adv: AgentAdvSettings = {};
+        if (agentFormReduceHallucinations) adv.reduceHallucinations = true;
+        if (agentFormMaxTurns && parseInt(agentFormMaxTurns) > 0) adv.maxTurns = parseInt(agentFormMaxTurns);
+        if (agentFormMaxBudget && parseFloat(agentFormMaxBudget) > 0) adv.maxBudgetUsd = parseFloat(agentFormMaxBudget);
+        if (agentFormEffort) adv.effort = agentFormEffort;
+        setAgentAdvSettings((prev) => ({ ...prev, [savedId]: adv }));
       }
       await refresh();
       resetAgentForm();
@@ -631,7 +1092,11 @@ function App() {
 
   const parseAgentResponse = (raw: string): { session_id: string; result: string } => {
     try {
-      return JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      return {
+        session_id: parsed.session_id || "",
+        result: parsed.result || raw,
+      };
     } catch {
       return { session_id: "", result: raw };
     }
@@ -647,21 +1112,116 @@ function App() {
     const gwsEnabled = enabledIntegrations.includes("gws");
     const gwsSection = gwsEnabled ? `
 
-=== 도구 안내 ===
-Google Workspace 연동이 활성화되어 있습니다. Bash 도구로 gws CLI를 사용할 수 있습니다.
-- Gmail: gws gmail messages list/get/send, gws gmail drafts create
-- Calendar: gws calendar events list/create/update/delete
-- Drive: gws drive files list/get
-- Docs: gws docs documents get/create
-역할에 맞는 gws 명령어만 사용하세요. 지시사항의 제약사항을 준수하세요.` : "";
+=== Google Workspace 도구 안내 ===
+gws CLI가 활성화되어 있습니다. Bash 도구를 통해 아래 명령어를 사용할 수 있습니다.
+
+[Gmail]
+- gws gmail messages list --maxResults=10  # 받은편지함 목록
+- gws gmail messages get <messageId>  # 메일 읽기
+- gws gmail messages send --to="email@example.com" --subject="제목" --body="본문"  # 메일 발송
+- gws gmail drafts create --to="email@example.com" --subject="제목" --body="본문"  # 임시저장
+
+[Calendar]
+- gws calendar events list  # 오늘 일정
+- gws calendar events list --timeMin="2024-01-01T00:00:00Z" --timeMax="2024-01-31T23:59:59Z"  # 기간 일정
+- gws calendar events create --summary="회의" --start="2024-01-15T14:00:00" --end="2024-01-15T15:00:00" --attendees="a@b.com,c@d.com"  # 일정 생성
+- gws calendar events update <eventId> --summary="변경된 제목"  # 일정 수정
+- gws calendar events delete <eventId>  # 일정 삭제
+
+[Drive]
+- gws drive files list --maxResults=10  # 내 드라이브 파일 목록
+- gws drive files list --driveId=<id> --corpora=drive  # 공유 드라이브 파일 목록
+- gws drive drives list  # 공유 드라이브 목록
+- gws drive files get <fileId>  # 파일 정보
+- gws drive files download <fileId> --outputPath="./downloaded.pdf"  # 파일 다운로드
+- gws drive files upload --filePath="./report.pdf" --name="보고서.pdf"  # 내 드라이브에 업로드
+- gws drive files upload --filePath="./report.pdf" --name="보고서.pdf" --parents=<folderId>  # 특정 폴더에 업로드
+- gws drive files search --query="name contains '보고서'"  # 파일 검색
+
+[Docs]
+- gws docs documents get <documentId>  # 문서 읽기
+- gws docs documents create --title="문서 제목" --body="내용"  # 문서 생성
+
+주의사항:
+- 역할에 맞는 gws 명령어만 사용하세요
+- 이메일 발송 시 수신자를 반드시 확인하세요
+- 중요 작업 전 사용자에게 확인을 구하세요${driveFolders.length > 0 ? `
+
+[등록된 Drive 폴더]
+${driveFolders.map((f) => `- "${f.label}": folderId=${f.folderId}${f.driveId ? `, driveId=${f.driveId} (공유 드라이브)` : " (내 드라이브)"}`).join("\n")}
+파일을 저장할 때 사용자가 위 이름을 언급하면 해당 folderId의 --parents 옵션을 사용하세요.
+공유 드라이브 폴더는 --supportsAllDrives 플래그를 추가하세요.` : ""}` : "";
+
+    const adv = agentAdvSettings[agent.id] || {};
+    const hallucinationGuard = adv.reduceHallucinations ? `
+
+=== 거짓말 방지 — 반드시 지킬 것 ===
+
+당신은 절대로 사실이 아닌 정보를 만들어내면 안 됩니다. 아래 규칙을 하나라도 어기면 심각한 문제가 됩니다.
+
+**핵심 원칙: 모르면 모른다고 해라**
+- 확실하지 않으면 "정확한 정보를 찾지 못했습니다" 또는 "확인이 필요합니다"라고 말하세요.
+- 절대로 그럴듯하게 꾸며내지 마세요. 틀린 답변보다 "모르겠습니다"가 100배 낫습니다.
+
+**출처 표기 규칙 (반드시 따를 것)**
+1. 웹에서 찾은 정보는 반드시 출처 URL을 함께 적으세요
+2. 수치, 통계, 날짜 등 팩트를 언급할 때는 어디서 확인했는지 밝히세요
+3. 출처를 찾을 수 없는 정보는 아예 쓰지 마세요
+
+출처 표기 예시:
+> 2024년 매출은 약 500억원입니다. ([출처](https://example.com/ir/2024))
+> 직원 수는 약 1,200명입니다. ([출처](https://example.com/about))
+
+**신뢰도 표시 (숫자/통계 등 핵심 팩트에 표시)**
+- 공식 자료에서 직접 확인한 경우: [확인됨]
+- 간접 정보나 추론인 경우: [추정]
+- 확인할 수 없는 경우: [미확인]
+
+예시:
+> - 2024년 매출: 523억원 [확인됨] ([출처](https://example.com/ir))
+> - 시장 점유율: 약 15~20% [추정] (정확한 공식 데이터 없음)
+> - 해외 진출 계획: 2025년 하반기 [미확인]
+
+**추가 규칙**
+- 검색 결과나 제공된 문서에 없는 정보를 배경지식으로 채우지 마세요
+- "약", "대략", "~정도" 대신 가능하면 정확한 수치를 쓰세요. 정확한 수치를 모르면 범위로 표현하세요
+- 여러 출처가 상충하면 그 사실을 명시하세요` : "";
+
+    const savePathSection = defaultSavePath ? `
+
+=== 파일 저장 경로 ===
+파일을 생성하거나 저장할 때는 반드시 아래 경로에 저장하세요:
+${defaultSavePath}
+
+절대로 다른 경로에 파일을 저장하지 마세요. Write 도구를 사용할 때 이 경로를 기본 디렉토리로 사용하세요.
+예: ${defaultSavePath}/보고서.md, ${defaultSavePath}/분석결과.csv 등` : "";
+
+    // Inject relevant knowledge memories (max 10 most recent)
+    const categoryLabel: Record<string, string> = { client: "고객", project: "프로젝트", person: "인물", decision: "결정", fact: "사실" };
+    const relevantMemories = memoryEnabled && knowledgeMemory.length > 0
+      ? knowledgeMemory.slice(-10).map((m) => `- [${categoryLabel[m.category] || m.category}] ${m.subject}: ${m.content}`).join("\n")
+      : "";
+    const memorySection = relevantMemories ? `
+
+=== 기억된 정보 (이전 대화에서 학습) ===
+아래는 이전 대화에서 추출한 중요 정보입니다. 관련 있을 때 참고하세요.
+${relevantMemories}` : "";
+
+    const staffInfo = staffList.length > 0
+      ? `\n\n=== 회사 구성원 연락처 ===\n${staffList.map((s) => `- ${s.name}${s.role ? ` (${s.role})` : ""}${s.email ? ` — 이메일: ${s.email}` : ""}${s.phone ? ` — 전화: ${s.phone}` : ""}${s.notes ? ` — 메모: ${s.notes}` : ""}`).join("\n")}\n\n이메일이나 연락처가 필요하면 위 목록을 참고하세요. 절대로 사용자에게 다시 물어보지 마세요.`
+      : "";
 
     return `${agent.instructions}
 
 === 팀 컨텍스트 ===
+사용자(당신의 상사): ${authUser?.name || "사용자"}${authUser?.email ? ` (${authUser.email})` : ""}
+메일, 문서 등 외부 커뮤니케이션은 반드시 사용자의 이름(${authUser?.name || "사용자"})으로 작성하세요. 절대로 당신(AI 에이전트)의 이름으로 보내지 마세요.
+
 당신의 이름: ${agent.name}
 당신의 역할: ${agent.role}
 같은 팀 동료:
-${teammateInfo}${gwsSection}
+${teammateInfo}${staffInfo}
+${gwsSection}${hallucinationGuard}${savePathSection}${memorySection}
 
 참고: 동료의 작업 결과를 전달받으면 그 맥락을 이해하고 이어서 작업하세요.
 사용자가 다른 팀원의 결과를 언급하면 그 정보를 활용하세요.`;
@@ -683,6 +1243,12 @@ ${teammateInfo}${gwsSection}
     const instructions = buildInstructions(agent);
     const allowedTools = agent.tools.join(",");
     const disallowedTools = agent.not_allowed.length > 0 ? agent.not_allowed.join(",") : null;
+    const adv = agentAdvSettings[agent.id] || {};
+    const sdkExtra = {
+      maxTurns: adv.maxTurns || null,
+      maxBudgetUsd: adv.maxBudgetUsd || null,
+      effort: adv.effort || null,
+    };
 
     const runNew = async () =>
       invoke<string>("run_agent", {
@@ -691,7 +1257,9 @@ ${teammateInfo}${gwsSection}
         allowedTools,
         disallowedTools,
         sessionId: null,
+        enableCheckpointing: true,
         cwd: null,
+        ...sdkExtra,
       });
 
     try {
@@ -704,7 +1272,9 @@ ${teammateInfo}${gwsSection}
             allowedTools,
             disallowedTools,
             sessionId: existingSession,
+            enableCheckpointing: true,
             cwd: null,
+            ...sdkExtra,
           });
         } catch {
           // Session expired — start fresh
@@ -736,6 +1306,383 @@ ${teammateInfo}${gwsSection}
     }
   };
 
+  // Unified chat: parse @agentName from prompt, route to agent, store locally
+  const handleChatSend = async () => {
+    const p = prompt.trim();
+    if (!p) return;
+    // If agent is already running
+    if (chatRunningAgent) {
+      // Check if user is @mentioning a DIFFERENT agent — cancel current and let it fall through
+      const mentionCheck = p.match(/^@(\S+)\s*/);
+      const mentionedName = mentionCheck?.[1];
+      const isDifferentAgent = mentionedName && mentionedName.toLowerCase() !== chatRunningAgent.toLowerCase();
+
+      if (isDifferentAgent) {
+        // Cancel current agent, then fall through to normal send
+        try { await invoke("cancel_agent"); } catch {}
+        await new Promise((r) => setTimeout(r, 300));
+      } else {
+        // Same agent or no mention — interject
+        setPrompt("");
+        const msg = p;
+        if (!activeConvoId) return;
+        const agentName = streamRunningAgentRef.current || chatRunningAgent;
+        const userTs = Date.now();
+        const newPlaceholderTs = userTs + 1;
+        streamTargetTsRef.current = newPlaceholderTs;
+        updateConvo(activeConvoId, (c) => ({
+          ...c,
+          messages: [
+            ...c.messages,
+            { role: "user" as const, text: msg, ts: userTs },
+            { role: "agent" as const, agentName, text: "", ts: newPlaceholderTs },
+          ],
+        }));
+        try { await invoke("interject_agent", { text: msg }); } catch (e) { console.warn("Interject failed:", e); }
+        return;
+      }
+    }
+    setPrompt("");
+    setShowMentionPicker(false);
+
+    // Ensure we have an active conversation
+    let convoId = activeConvoId;
+    if (!convoId) {
+      convoId = createConvo();
+    }
+
+    // Parse @agentName or @teamName at the start of the message
+    const mentionMatch = p.match(/^@(\S+)\s*([\s\S]*)/);
+    let targetAgent: Agent | undefined;
+    let targetTeam: AgentTeam | undefined;
+    let userMessage: string;
+
+    if (mentionMatch) {
+      const name = mentionMatch[1];
+      userMessage = mentionMatch[2] || "";
+      targetAgent = activeAgents.find((a) => a.name.toLowerCase() === name.toLowerCase());
+      if (!targetAgent) {
+        // Try matching team name
+        targetTeam = agentTeams.find((t) => t.name.toLowerCase() === name.toLowerCase());
+        if (!targetTeam) {
+          updateConvo(convoId, (c) => ({
+            ...c,
+            messages: [...c.messages, { role: "user", text: p }, { role: "system", text: `"${name}" ${lang === "ko" ? "을(를) 찾을 수 없습니다." : "not found."}` }],
+          }));
+          return;
+        }
+      }
+    } else if (activeAgents.length === 1) {
+      targetAgent = activeAgents[0];
+      userMessage = p;
+    } else {
+      // Fall back to last used agent in this conversation
+      const convo = conversations.find((c) => c.id === convoId);
+      if (convo?.lastAgentId) {
+        targetAgent = activeAgents.find((a) => a.id === convo.lastAgentId);
+      }
+      if (!targetAgent) {
+        updateConvo(convoId, (c) => ({
+          ...c,
+          messages: [...c.messages, { role: "user", text: p }, { role: "system", text: lang === "ko" ? `@팀원이름 또는 @팀이름으로 시작해주세요` : "Start with @agentName or @teamName" }],
+        }));
+        return;
+      }
+      userMessage = p;
+    }
+
+    // If team was mentioned, run team execution within the chat
+    if (targetTeam && !targetAgent) {
+      const teamMsg = userMessage || p;
+      const userMsg: ChatMsg = { role: "user", text: p, files: chatFiles.map((f) => f.name), ts: Date.now() };
+      updateConvo(convoId, (c) => ({
+        ...c,
+        title: c.messages.length === 0 ? teamMsg.slice(0, 30) : c.title,
+        messages: [...c.messages, userMsg],
+      }));
+      setChatRunningAgent(`${targetTeam.name}`);
+      setChatFiles([]);
+
+      try {
+        const plan = await runAgentTeam(targetTeam.id, teamMsg);
+        const lead = plan.agents.find((a) => a.is_lead) || plan.agents[0];
+        const workers = plan.agents.filter((a) => a.agent_id !== lead.agent_id);
+
+        const subagents: Record<string, { description: string; prompt: string; tools: string[] }> = {};
+        for (const w of workers) {
+          subagents[w.name] = {
+            description: w.instructions.slice(0, 200),
+            prompt: w.instructions || `You are ${w.name}.`,
+            tools: w.tools || [],
+          };
+        }
+
+        const teamPromptText = workers.length > 0
+          ? `팀 명령: ${teamMsg}\n\n필요한 팀원에게 작업을 위임하고 결과를 종합해주세요.`
+          : teamMsg;
+        const leadInstructions = `${lead.instructions}\n\n=== 팀 컨텍스트 ===\n당신의 이름: ${lead.name}\n같은 팀 동료:\n${workers.map((w) => `- ${w.name}: ${w.instructions.slice(0, 80)}...`).join("\n") || "없음"}\n\nSDK 서브에이전트로 팀원이 등록되어 있습니다. 필요에 따라 자동으로 위임됩니다.`;
+
+        const allowedTools = lead.tools.join(",");
+        const disallowedTools = lead.not_allowed.length > 0 ? lead.not_allowed.join(",") : null;
+        const convoSess = activeConvo?.sessions || {};
+        const existSess = convoSess[lead.agent_id];
+        const leadAdv2 = agentAdvSettings[lead.agent_id] || {};
+        const teamExtra = { maxTurns: leadAdv2.maxTurns || null, maxBudgetUsd: leadAdv2.maxBudgetUsd || null, effort: leadAdv2.effort || null };
+
+        let raw: string;
+        if (existSess) {
+          try {
+            raw = await invoke<string>("resume_agent", { prompt: teamPromptText, instructions: leadInstructions, allowedTools, disallowedTools, sessionId: existSess, agents: JSON.stringify(subagents), enableCheckpointing: true, cwd: null, ...teamExtra });
+          } catch {
+            updateConvo(convoId, (c) => { const s = { ...c.sessions }; delete s[lead.agent_id]; return { ...c, sessions: s }; });
+            raw = await invoke<string>("run_agent", { prompt: teamPromptText, instructions: leadInstructions, allowedTools, disallowedTools, sessionId: null, agents: JSON.stringify(subagents), enableCheckpointing: true, cwd: null, ...teamExtra });
+          }
+        } else {
+          raw = await invoke<string>("run_agent", { prompt: teamPromptText, instructions: leadInstructions, allowedTools, disallowedTools, sessionId: null, agents: JSON.stringify(subagents), enableCheckpointing: true, cwd: null, ...teamExtra });
+        }
+
+        const { session_id, result } = parseAgentResponse(raw);
+        updateConvo(convoId, (c) => ({
+          ...c,
+          lastAgentId: lead.agent_id,
+          sessions: session_id ? { ...c.sessions, [lead.agent_id]: session_id } : c.sessions,
+          messages: [...c.messages, { role: "agent", agentName: `${targetTeam.name}`, text: result, ts: Date.now() }],
+        }));
+        // Background memory extraction
+        const tConvoTitle = activeConvo?.title || "대화";
+        extractMemories(teamMsg, result, targetTeam.name, tConvoTitle);
+      } catch (e) {
+        updateConvo(convoId, (c) => ({
+          ...c,
+          messages: [...c.messages, { role: "agent", agentName: `${targetTeam.name}`, text: `${e}`, ts: Date.now(), error: true }],
+        }));
+      } finally {
+        setChatRunningAgent(null);
+      }
+      return;
+    }
+
+    // At this point targetAgent is guaranteed to be defined
+    if (!targetAgent) return;
+
+    // Build file context if files are attached
+    const fileCtx = chatFiles.length > 0
+      ? `\n\n[첨부 파일 — Read 도구로 즉시 읽을 수 있음]\n${chatFiles.map((f) => `- ${f.name}: ${f.path}`).join("\n")}\n\nRead 도구를 사용하여 위 파일을 읽고 작업해주세요. 권한은 이미 허용되어 있습니다.`
+      : "";
+    const fullMessage = userMessage + fileCtx;
+
+    // Add user message with file info
+    const userMsg: ChatMsg = { role: "user", text: p, files: chatFiles.map((f) => f.name), ts: Date.now() };
+    updateConvo(convoId, (c) => ({
+      ...c,
+      title: c.messages.length === 0 ? (userMessage.slice(0, 30) || p.slice(0, 30)) : c.title,
+      messages: [...c.messages, userMsg],
+    }));
+    setChatRunningAgent(targetAgent.name);
+    setChatFiles([]);
+
+    const convoSessions = activeConvo?.sessions || {};
+    const existingSession = convoSessions[targetAgent.id];
+    const instructions = buildInstructions(targetAgent);
+    const allowedTools = targetAgent.tools.join(",");
+    const disallowedTools = targetAgent.not_allowed.length > 0 ? targetAgent.not_allowed.join(",") : null;
+    const chatAdv = agentAdvSettings[targetAgent.id] || {};
+    const chatSdkExtra = {
+      maxTurns: chatAdv.maxTurns || null,
+      maxBudgetUsd: chatAdv.maxBudgetUsd || null,
+      effort: chatAdv.effort || null,
+    };
+
+    // Add placeholder agent message for streaming (ensure unique ts)
+    const streamMsgTs = Date.now() + 1;
+    streamTargetTsRef.current = streamMsgTs;
+    streamRunningAgentRef.current = targetAgent.name;
+    updateConvo(convoId, (c) => ({
+      ...c,
+      messages: [...c.messages, { role: "agent" as const, agentName: targetAgent.name, text: "", ts: streamMsgTs }],
+    }));
+
+    // Listen for streaming deltas — uses ref so interject can redirect to new placeholder
+    let streamedText = "";
+    let currentTargetTs = streamMsgTs;
+    const unlisten = await listen<string>("agent-stream-delta", (event) => {
+      // Check if interject created a new target
+      if (streamTargetTsRef.current !== currentTargetTs) {
+        currentTargetTs = streamTargetTsRef.current;
+        streamedText = ""; // reset for new message
+      }
+      streamedText += event.payload;
+      const tsToUpdate = currentTargetTs;
+      updateConvo(convoId, (c) => {
+        const msgs = [...c.messages];
+        const idx = msgs.findIndex((m) => m.role === "agent" && m.ts === tsToUpdate);
+        if (idx >= 0) {
+          msgs[idx] = { ...msgs[idx], text: streamedText };
+        }
+        return { ...c, messages: msgs };
+      });
+    });
+
+    try {
+      let raw: string;
+      if (existingSession) {
+        try {
+          raw = await invoke<string>("resume_agent_stream", {
+            prompt: fullMessage,
+            instructions,
+            allowedTools,
+            disallowedTools,
+            sessionId: existingSession,
+            enableCheckpointing: true,
+            cwd: null,
+            ...chatSdkExtra,
+          });
+        } catch {
+          updateConvo(convoId, (c) => {
+            const s = { ...c.sessions };
+            delete s[targetAgent.id];
+            return { ...c, sessions: s };
+          });
+          streamedText = "";
+          raw = await invoke<string>("run_agent_stream", {
+            prompt: fullMessage,
+            instructions,
+            allowedTools,
+            disallowedTools,
+            sessionId: null,
+            enableCheckpointing: true,
+            cwd: null,
+            ...chatSdkExtra,
+          });
+        }
+      } else {
+        raw = await invoke<string>("run_agent_stream", {
+          prompt: fullMessage,
+          instructions,
+          allowedTools,
+          disallowedTools,
+          sessionId: null,
+          enableCheckpointing: true,
+          cwd: null,
+          ...chatSdkExtra,
+        });
+      }
+
+      unlisten();
+      const { session_id, result } = parseAgentResponse(raw);
+      const finalTs = streamTargetTsRef.current;
+      // Update the current streaming target message with final result
+      updateConvo(convoId, (c) => {
+        const msgs = [...c.messages];
+        const idx = msgs.findIndex((m) => m.role === "agent" && m.ts === finalTs);
+        if (idx >= 0) {
+          msgs[idx] = { ...msgs[idx], text: result };
+        }
+        return {
+          ...c,
+          lastAgentId: targetAgent.id,
+          sessions: session_id ? { ...c.sessions, [targetAgent.id]: session_id } : c.sessions,
+          messages: msgs,
+        };
+      });
+      // Background memory extraction (no await — fire and forget)
+      const convoTitle = activeConvo?.title || "대화";
+      extractMemories(userMessage, result, targetAgent.name, convoTitle);
+    } catch (e) {
+      unlisten();
+      const errStr = `${e}`;
+      const isCancelled = errStr.includes("cancelled");
+      const errorTs = streamTargetTsRef.current;
+      updateConvo(convoId, (c) => {
+        const msgs = [...c.messages];
+        const idx = msgs.findIndex((m) => m.role === "agent" && m.ts === errorTs);
+        if (idx >= 0) {
+          if (isCancelled && streamedText) {
+            msgs[idx] = { ...msgs[idx], text: streamedText };
+          } else if (isCancelled) {
+            msgs.splice(idx, 1);
+          } else {
+            msgs[idx] = { ...msgs[idx], text: errStr, error: true };
+          }
+        }
+        return { ...c, lastAgentId: targetAgent.id, messages: msgs };
+      });
+    } finally {
+      setChatRunningAgent(null);
+      streamTargetTsRef.current = 0;
+      streamRunningAgentRef.current = null;
+    }
+  };
+
+  const handleChatNewConvo = () => {
+    createConvo();
+  };
+
+  const handleDeleteConvo = (id: string) => {
+    setConversations((prev) => prev.filter((c) => c.id !== id));
+    if (activeConvoId === id) {
+      const remaining = conversations.filter((c) => c.id !== id);
+      setActiveConvoId(remaining.length > 0 ? remaining[0].id : null);
+    }
+  };
+
+  // File upload handler
+  const handleFileUpload = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    for (const file of Array.from(files)) {
+      try {
+        const buffer = await file.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        // Chunk-based base64 encoding to avoid stack overflow on large files
+        const chunks: string[] = [];
+        const CHUNK = 8192;
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          chunks.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK)));
+        }
+        const base64 = btoa(chunks.join(""));
+        const savedPath = await invoke<string>("save_chat_file", {
+          fileName: file.name,
+          fileDataBase64: base64,
+        });
+        setChatFiles((prev) => [...prev, { name: file.name, path: savedPath }]);
+      } catch (e) {
+        console.error("File upload failed:", e);
+      }
+    }
+  };
+
+  // @mention input handling
+  const handleChatInputChange = (value: string) => {
+    setPrompt(value);
+    // Check if user is typing @
+    const lastAt = value.lastIndexOf("@");
+    if (lastAt >= 0 && (lastAt === 0 || value[lastAt - 1] === " ")) {
+      const after = value.slice(lastAt + 1);
+      if (!after.includes(" ")) {
+        setShowMentionPicker(true);
+        setMentionFilter(after.toLowerCase());
+        setMentionIndex(0);
+        return;
+      }
+    }
+    setShowMentionPicker(false);
+  };
+
+  const insertMention = (agentName: string) => {
+    const lastAt = prompt.lastIndexOf("@");
+    const before = prompt.slice(0, lastAt);
+    setPrompt(`${before}@${agentName} `);
+    setShowMentionPicker(false);
+    chatInputRef.current?.focus();
+  };
+
+  const filteredMentionAgents = activeAgents.filter((a) =>
+    a.name.toLowerCase().includes(mentionFilter)
+  );
+  const filteredMentionTeams = agentTeams.filter((t) =>
+    t.name.toLowerCase().includes(mentionFilter)
+  );
+
   const handleDeleteAgent = async (id: number) => {
     try {
       await apiDeleteAgent(id);
@@ -761,120 +1708,86 @@ ${teammateInfo}${gwsSection}
     try {
       const plan = await runAgentTeam(atId, p);
 
-      // Build team-aware instructions for each agent
-      const enrichInstructions = (agent: typeof plan.agents[0]) => {
-        const teammates = plan.agents.filter((a) => a.agent_id !== agent.agent_id);
-        const teammateInfo = teammates.map((a) => `- ${a.name}: ${a.instructions.slice(0, 80)}...`).join("\n");
-        return `${agent.instructions}\n\n=== 팀 컨텍스트 ===\n당신의 이름: ${agent.name}\n팀 실행 모드: ${plan.execution_mode}\n같은 팀 동료:\n${teammateInfo}\n\n팀 명령을 받아 자신의 역할에 맞는 부분을 수행하세요.`;
+      // Find lead agent; fallback to first agent
+      const lead = plan.agents.find((a) => a.is_lead) || plan.agents[0];
+      const workers = plan.agents.filter((a) => a.agent_id !== lead.agent_id);
+
+      // Build SDK subagents map from workers
+      const subagents: Record<string, { description: string; prompt: string; tools: string[] }> = {};
+      for (const w of workers) {
+        subagents[w.name] = {
+          description: `${w.instructions.slice(0, 200)}`,
+          prompt: w.instructions || `You are ${w.name}.`,
+          tools: w.tools || [],
+        };
+      }
+
+      const teamPrompt = workers.length > 0
+        ? `팀 명령: ${p}\n\n필요한 팀원에게 작업을 위임하고 결과를 종합해주세요.`
+        : p;
+
+      const leadInstructions = `${lead.instructions}\n\n=== 팀 컨텍스트 ===\n당신의 이름: ${lead.name}\n같은 팀 동료:\n${workers.map((w) => `- ${w.name}: ${w.instructions.slice(0, 80)}...`).join("\n") || "없음"}\n\nSDK 서브에이전트로 팀원이 등록되어 있습니다. 필요에 따라 자동으로 위임됩니다.`;
+
+      const allowedTools = lead.tools.join(",");
+      const disallowedTools = lead.not_allowed.length > 0 ? lead.not_allowed.join(",") : null;
+      const existingSession = agentSessions[lead.agent_id];
+      const leadAdv = agentAdvSettings[lead.agent_id] || {};
+      const teamSdkExtra = {
+        maxTurns: leadAdv.maxTurns || null,
+        maxBudgetUsd: leadAdv.maxBudgetUsd || null,
+        effort: leadAdv.effort || null,
       };
 
-      if (plan.execution_mode === "sequential") {
-        let prevContext = "";
-        for (const agent of plan.agents) {
-          const fullPrompt = prevContext
-            ? `[팀 명령] ${p}\n\n--- 이전 팀원 작업 결과 (이어서 작업하세요) ---\n${prevContext}`
-            : `[팀 명령] ${p}`;
-          const allowedTools = agent.tools.join(",");
-          const disallowedTools = agent.not_allowed.length > 0 ? agent.not_allowed.join(",") : null;
-          const existingSession = agentSessions[agent.agent_id];
-
-          let raw: string;
-          if (existingSession) {
-            try {
-              raw = await invoke<string>("resume_agent", {
-                prompt: fullPrompt,
-                instructions: enrichInstructions(agent),
-                allowedTools,
-                disallowedTools,
-                sessionId: existingSession,
-                cwd: null,
-              });
-            } catch {
-              setAgentSessions((prev) => { const n = { ...prev }; delete n[agent.agent_id]; return n; });
-              raw = await invoke<string>("run_agent", {
-                prompt: fullPrompt,
-                instructions: enrichInstructions(agent),
-                allowedTools,
-                disallowedTools,
-                sessionId: null,
-                cwd: null,
-              });
-            }
-          } else {
-            raw = await invoke<string>("run_agent", {
-              prompt: fullPrompt,
-              instructions: enrichInstructions(agent),
-              allowedTools,
-              disallowedTools,
-              sessionId: null,
-              cwd: null,
-            });
-          }
-
-          const { session_id, result } = parseAgentResponse(raw);
-          if (session_id) {
-            setAgentSessions((prev) => ({ ...prev, [agent.agent_id]: session_id }));
-          }
-          prevContext += `[${agent.name}]: ${result}\n`;
-          setTeamChats((prev) => ({
-            ...prev,
-            [atId]: [...(prev[atId] || []), { role: "agent", agentName: agent.name, text: result }],
-          }));
+      let raw: string;
+      if (existingSession) {
+        try {
+          raw = await invoke<string>("resume_agent", {
+            prompt: teamPrompt,
+            instructions: leadInstructions,
+            allowedTools,
+            disallowedTools,
+            sessionId: existingSession,
+            agents: JSON.stringify(subagents),
+            enableCheckpointing: true,
+            cwd: null,
+            ...teamSdkExtra,
+          });
+        } catch {
+          setAgentSessions((prev) => { const n = { ...prev }; delete n[lead.agent_id]; return n; });
+          raw = await invoke<string>("run_agent", {
+            prompt: teamPrompt,
+            instructions: leadInstructions,
+            allowedTools,
+            disallowedTools,
+            sessionId: null,
+            agents: JSON.stringify(subagents),
+            enableCheckpointing: true,
+            cwd: null,
+            ...teamSdkExtra,
+          });
         }
       } else {
-        // Parallel — all at once, with session support
-        const promises = plan.agents.map(async (agent) => {
-          const allowedTools = agent.tools.join(",");
-          const disallowedTools = agent.not_allowed.length > 0 ? agent.not_allowed.join(",") : null;
-          const existingSession = agentSessions[agent.agent_id];
-
-          let raw: string;
-          if (existingSession) {
-            try {
-              raw = await invoke<string>("resume_agent", {
-                prompt: `[팀 명령] ${p}`,
-                instructions: enrichInstructions(agent),
-                allowedTools,
-                disallowedTools,
-                sessionId: existingSession,
-                cwd: null,
-              });
-            } catch {
-              setAgentSessions((prev) => { const n = { ...prev }; delete n[agent.agent_id]; return n; });
-              raw = await invoke<string>("run_agent", {
-                prompt: `[팀 명령] ${p}`,
-                instructions: enrichInstructions(agent),
-                allowedTools,
-                disallowedTools,
-                sessionId: null,
-                cwd: null,
-              });
-            }
-          } else {
-            raw = await invoke<string>("run_agent", {
-              prompt: `[팀 명령] ${p}`,
-              instructions: enrichInstructions(agent),
-              allowedTools,
-              disallowedTools,
-              sessionId: null,
-              cwd: null,
-            });
-          }
-
-          const { session_id, result } = parseAgentResponse(raw);
-          if (session_id) {
-            setAgentSessions((prev) => ({ ...prev, [agent.agent_id]: session_id }));
-          }
-          return { agentName: agent.name, result };
+        raw = await invoke<string>("run_agent", {
+          prompt: teamPrompt,
+          instructions: leadInstructions,
+          allowedTools,
+          disallowedTools,
+          sessionId: null,
+          agents: JSON.stringify(subagents),
+          enableCheckpointing: true,
+          cwd: null,
+          ...teamSdkExtra,
         });
-        const results = await Promise.all(promises);
-        for (const r of results) {
-          setTeamChats((prev) => ({
-            ...prev,
-            [atId]: [...(prev[atId] || []), { role: "agent", agentName: r.agentName, text: r.result }],
-          }));
-        }
       }
+
+      const { session_id, result } = parseAgentResponse(raw);
+      if (session_id) {
+        setAgentSessions((prev) => ({ ...prev, [lead.agent_id]: session_id }));
+      }
+      setTeamChats((prev) => ({
+        ...prev,
+        [atId]: [...(prev[atId] || []), { role: "agent", agentName: lead.name, text: result }],
+      }));
     } catch (e) {
       setTeamChats((prev) => ({
         ...prev,
@@ -947,6 +1860,7 @@ ${hasBash ? `
         allowedTools: "",
         disallowedTools: null,
         sessionId: null,
+        enableCheckpointing: false,
       });
       setAgentFormInstructions(result);
     } catch (e) {
@@ -967,10 +1881,8 @@ ${hasBash ? `
           agent_id: id,
           order: i + 1,
           is_lead: id === teamFormLead,
-          condition: teamFormConditions[id] || "",
           requires_approval: teamFormApprovals[id] || false,
         })),
-        execution_mode: teamFormMode,
       });
       await refresh();
       setShowTeamForm(false);
@@ -1133,6 +2045,7 @@ ${hasBash ? `
             allowedTools: "",
             disallowedTools: null,
             sessionId: null,
+            enableCheckpointing: false,
             cwd: null,
           }).then(() => setClaudeStatus("ok")).catch(() => setClaudeStatus("missing"));
         }
@@ -1252,9 +2165,11 @@ ${hasBash ? `
                 </button>
               )}
               <button
-                onClick={() => {
+                onClick={async () => {
                   if (isLast) {
                     localStorage.setItem("flaude_setup_done", "true");
+                    // Default agents/team are auto-created on initial load when agents.length === 0
+                    await refresh();
                     setSetupDone(true);
                   } else {
                     setWizardStep(wizardStep + 1);
@@ -1279,7 +2194,7 @@ ${hasBash ? `
           <h1 className="text-xl font-serif font-bold text-[#D97706]">Flaude</h1>
         </div>
         <nav className="flex-1 p-2">
-          {(["agents", "teams", "clients"] as Page[]).map((page) => (
+          {(["chat", "agents", "teams", "clients"] as Page[]).map((page) => (
             <button
               key={page}
               onClick={() => {
@@ -1296,6 +2211,7 @@ ${hasBash ? `
                   : "text-[#6B7280] hover:bg-gray-100"
               }`}
             >
+              {page === "chat" && t("nav.chat")}
               {page === "agents" && t("nav.members")}
               {page === "teams" && t("nav.teams")}
               {page === "clients" && t("nav.clients")}
@@ -1332,6 +2248,397 @@ ${hasBash ? `
           <div className="m-4 p-3 bg-gray-50 border border-gray-200 rounded text-sm text-[#6B7280]">
             {error}
             <button onClick={() => setError("")} className="ml-2 underline text-xs">{t("empty.dismiss")}</button>
+          </div>
+        )}
+
+        {/* ═══ CHAT ═══ */}
+        {currentPage === "chat" && (
+          <div className="flex-1 flex flex-col h-full bg-[#FAFAF8]"
+            onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+            onDrop={(e) => { e.preventDefault(); e.stopPropagation(); handleFileUpload(e.dataTransfer.files); }}
+          >
+            {(() => {
+              // Auto-create conversation if none
+              if (!activeConvo && conversations.length === 0) {
+                setTimeout(() => createConvo(), 0);
+              } else if (!activeConvo && conversations.length > 0) {
+                setTimeout(() => setActiveConvoId(conversations[0].id), 0);
+              }
+              return null;
+            })()}
+
+            {/* Top bar — minimal */}
+            <div className="flex items-center justify-between px-5 py-2.5 border-b border-gray-100 bg-white/80 backdrop-blur-sm">
+              <div className="flex items-center gap-2 min-w-0">
+                {/* History dropdown */}
+                {conversations.length > 1 && (
+                  <div className="relative">
+                    <button
+                      onClick={() => setConvoSearch(convoSearch === "__open__" ? "" : "__open__")}
+                      className="p-1.5 rounded-lg hover:bg-gray-100 text-[#9CA3AF] hover:text-[#374151] transition"
+                      title={lang === "ko" ? "이전 대화" : "History"}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                    </button>
+                    {convoSearch === "__open__" && (
+                      <>
+                        <div className="fixed inset-0 z-40" onClick={() => setConvoSearch("")} />
+                        <div className="absolute left-0 top-full mt-1 w-72 bg-white rounded-xl shadow-xl border border-gray-100 z-50 overflow-hidden animate-[fadeIn_0.1s_ease]">
+                          {conversations.length > 5 && (
+                            <div className="px-3 pt-2.5">
+                              <input
+                                autoFocus
+                                type="text"
+                                placeholder={lang === "ko" ? "검색..." : "Search..."}
+                                onChange={(e) => { if (e.target.value) setConvoSearch(e.target.value); else setConvoSearch("__open__"); }}
+                                className="w-full px-2.5 py-1.5 text-xs bg-gray-50 border border-gray-100 rounded-lg focus:outline-none focus:border-[#D97706]/40"
+                              />
+                            </div>
+                          )}
+                          <div className="max-h-72 overflow-auto p-1.5">
+                            {conversations.filter((c) => {
+                              const q = convoSearch !== "__open__" ? convoSearch : "";
+                              if (!q) return true;
+                              return c.title.toLowerCase().includes((q as string).toLowerCase());
+                            }).map((convo) => (
+                              <button
+                                key={convo.id}
+                                onClick={() => { setActiveConvoId(convo.id); setChatFiles([]); setConvoSearch(""); }}
+                                className={`w-full text-left px-3 py-2 rounded-lg flex items-center justify-between group transition ${
+                                  activeConvoId === convo.id ? "bg-[#D97706]/5" : "hover:bg-gray-50"
+                                }`}
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="text-sm text-[#374151] truncate">{convo.title}</div>
+                                  <div className="text-[10px] text-[#B0B0A8]">
+                                    {new Date(convo.createdAt).toLocaleDateString(lang === "ko" ? "ko-KR" : "en-US", { month: "short", day: "numeric" })}
+                                    {convo.messages.length > 0 && ` · ${convo.messages.length}`}
+                                  </div>
+                                </div>
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); handleDeleteConvo(convo.id); }}
+                                  className="opacity-0 group-hover:opacity-100 p-1 text-[#B0B0A8] hover:text-[#EF4444] transition"
+                                >
+                                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                </button>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+                {/* Current chat title */}
+                <span className="text-sm text-[#374151] truncate font-medium">
+                  {activeConvo?.title || (lang === "ko" ? "새 대화" : "New chat")}
+                </span>
+              </div>
+              <div className="flex items-center gap-1">
+                {/* Quick agent chips */}
+                <div className="hidden sm:flex items-center gap-0.5 mr-2">
+                  {activeAgents.slice(0, 4).map((a) => (
+                    <button
+                      key={a.id}
+                      onClick={() => { setPrompt((prev) => prev ? prev : `@${a.name} `); chatInputRef.current?.focus(); }}
+                      className="w-6 h-6 rounded-full hover:ring-2 hover:ring-[#D97706]/30 transition"
+                      title={`@${a.name} · ${a.role}`}
+                    >
+                      <img src={avatarUrl(a.name)} alt={a.name} className="w-6 h-6 rounded-full" />
+                    </button>
+                  ))}
+                </div>
+                {/* New chat button */}
+                <button
+                  onClick={handleChatNewConvo}
+                  className="p-1.5 rounded-lg hover:bg-gray-100 text-[#9CA3AF] hover:text-[#D97706] transition"
+                  title={lang === "ko" ? "새 대화 (⌘N)" : "New chat (⌘N)"}
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>
+                </button>
+              </div>
+            </div>
+
+            {activeConvo && (
+              <>
+                {/* Messages */}
+                <div className="flex-1 overflow-auto px-6 py-4">
+                  <div className="max-w-2xl mx-auto space-y-4">
+                    {chatMessages.length === 0 && !chatRunningAgent && (
+                      <div className="flex items-center justify-center" style={{ minHeight: "60vh" }}>
+                        <div className="text-center">
+                          <div className="flex justify-center gap-2 mb-4">
+                            {activeAgents.slice(0, 4).map((a) => (
+                              <img key={a.id} src={avatarUrl(a.name)} alt="" className="w-10 h-10 rounded-full border-2 border-white shadow-sm -ml-2 first:ml-0" />
+                            ))}
+                            {agentTeams.slice(0, 2).map((t) => (
+                              <div key={`t-${t.id}`} className="w-10 h-10 rounded-full border-2 border-white shadow-sm -ml-2 bg-gradient-to-br from-[#D97706] to-[#B45309] flex items-center justify-center">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                              </div>
+                            ))}
+                          </div>
+                          <p className="text-sm text-[#9CA3AF] mb-1">
+                            {lang === "ko" ? "@이름으로 팀원이나 팀에게 말을 걸어보세요" : "Mention a member or team with @name"}
+                          </p>
+                          <div className="flex flex-wrap gap-2 justify-center mt-3">
+                            {activeAgents.slice(0, 3).map((a) => (
+                              <button
+                                key={a.id}
+                                onClick={() => { setPrompt(`@${a.name} `); chatInputRef.current?.focus(); }}
+                                className="px-2.5 py-1 text-xs rounded-full border border-gray-200 text-[#6B7280] hover:border-[#D97706] hover:text-[#D97706] transition"
+                              >
+                                @{a.name}
+                              </button>
+                            ))}
+                            {agentTeams.slice(0, 2).map((t) => (
+                              <button
+                                key={`t-${t.id}`}
+                                onClick={() => { setPrompt(`@${t.name} `); chatInputRef.current?.focus(); }}
+                                className="px-2.5 py-1 text-xs rounded-full border border-[#D97706]/20 text-[#D97706] hover:bg-[#D97706]/5 transition"
+                              >
+                                @{t.name}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                      {chatMessages.map((msg, i) => (
+                        <div key={i} className={`group/msg flex ${msg.role === "user" ? "justify-end" : "justify-start"} gap-2.5 animate-[fadeIn_0.2s_ease]`}>
+                          {msg.role === "agent" && msg.agentName && (
+                            <img src={avatarUrl(msg.agentName)} alt="" className="w-8 h-8 rounded-full flex-shrink-0 mt-0.5 shadow-sm" />
+                          )}
+                          {msg.role === "system" && (
+                            <div className="w-8 h-8 rounded-full flex-shrink-0 mt-0.5 bg-gray-100 flex items-center justify-center">
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                            </div>
+                          )}
+                          <div className={msg.role === "user" ? "max-w-[75%]" : "max-w-[80%]"}>
+                            {msg.role === "agent" && msg.agentName && (
+                              <div className="text-[11px] text-[#9CA3AF] mb-1 ml-0.5 font-medium">{msg.agentName}</div>
+                            )}
+                            <div className={`px-4 py-2.5 text-sm leading-relaxed ${
+                              msg.role === "user"
+                                ? "bg-[#1A1A1A] text-white rounded-2xl rounded-br-md whitespace-pre-wrap"
+                                : msg.role === "system"
+                                ? "bg-amber-50 text-amber-700 rounded-2xl rounded-bl-md text-xs whitespace-pre-wrap"
+                                : msg.error
+                                ? "bg-white text-[#1A1A1A] rounded-2xl rounded-bl-md shadow-sm border border-red-200"
+                                : "bg-white text-[#1A1A1A] rounded-2xl rounded-bl-md shadow-sm border border-gray-100"
+                            }`}>
+                              {msg.role === "agent" && msg.text === "" && chatRunningAgent ? (
+                                <div className="flex gap-1 py-0.5">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-[#D97706] animate-bounce" style={{ animationDelay: "0ms" }} />
+                                  <span className="w-1.5 h-1.5 rounded-full bg-[#D97706] animate-bounce" style={{ animationDelay: "150ms" }} />
+                                  <span className="w-1.5 h-1.5 rounded-full bg-[#D97706] animate-bounce" style={{ animationDelay: "300ms" }} />
+                                </div>
+                              ) : msg.role === "agent" ? <MarkdownMessage text={msg.text} /> : msg.text}
+                            </div>
+                            {/* Action buttons: copy, retry */}
+                            {msg.role === "agent" && msg.text !== "" && (
+                              <div className="flex items-center gap-1 mt-1 ml-0.5 opacity-0 group-hover/msg:opacity-100 transition-opacity">
+                                <button onClick={() => copyMessage(msg.text, i)} className="p-1 rounded hover:bg-gray-100" title="Copy">
+                                  {copiedMsgIdx === i ? (
+                                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#22C55E" strokeWidth="2"><polyline points="20 6 9 17 4 12"/></svg>
+                                  ) : (
+                                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                                  )}
+                                </button>
+                                {msg.error && (
+                                  <button onClick={() => {
+                                    // Find last user message before this error and resend
+                                    const convo = conversations.find((c) => c.id === activeConvoId);
+                                    if (!convo) return;
+                                    const lastUser = [...convo.messages].slice(0, convo.messages.indexOf(msg)).reverse().find((m) => m.role === "user");
+                                    if (lastUser) {
+                                      // Remove error message and re-send
+                                      updateConvo(convo.id, (c) => ({ ...c, messages: c.messages.filter((_, mi) => mi !== convo.messages.indexOf(msg)) }));
+                                      setPrompt(lastUser.text);
+                                      setTimeout(() => handleChatSend(), 50);
+                                    }
+                                  }} className="p-1 rounded hover:bg-gray-100" title="Retry">
+                                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#EF4444" strokeWidth="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                            {/* Timestamp on hover */}
+                            {msg.ts && !chatRunningAgent && (
+                              <div className="text-[10px] text-[#D1D5DB] mt-0.5 ml-0.5 opacity-0 group-hover/msg:opacity-100 transition-opacity">
+                                {new Date(msg.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                              </div>
+                            )}
+                            {msg.files && msg.files.length > 0 && (
+                              <div className="flex gap-1 mt-1.5 flex-wrap">
+                                {msg.files.map((f, fi) => (
+                                  <span key={fi} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-gray-100 text-[10px] text-[#6B7280]">
+                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                    {f}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                      {/* Show dots only when running AND no streaming placeholder in message list */}
+                      {chatRunningAgent && !(chatMessages.length > 0 && chatMessages[chatMessages.length - 1].role === "agent") && (
+                        <div className="flex justify-start gap-2.5 animate-[fadeIn_0.2s_ease]">
+                          <img src={avatarUrl(chatRunningAgent)} alt="" className="w-8 h-8 rounded-full flex-shrink-0 mt-0.5 shadow-sm" />
+                          <div>
+                            <div className="text-[11px] text-[#9CA3AF] mb-1 ml-0.5 font-medium">{chatRunningAgent}</div>
+                            <div className="px-4 py-3 rounded-2xl rounded-bl-md bg-white shadow-sm border border-gray-100">
+                              <div className="flex gap-1">
+                                <span className="w-1.5 h-1.5 rounded-full bg-[#D97706] animate-bounce" style={{ animationDelay: "0ms" }} />
+                                <span className="w-1.5 h-1.5 rounded-full bg-[#D97706] animate-bounce" style={{ animationDelay: "150ms" }} />
+                                <span className="w-1.5 h-1.5 rounded-full bg-[#D97706] animate-bounce" style={{ animationDelay: "300ms" }} />
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      <div ref={chatEndRef} />
+                    </div>
+                  </div>
+
+                  {/* File chips */}
+                  {chatFiles.length > 0 && (
+                    <div className="px-6 pb-0">
+                      <div className="max-w-2xl mx-auto flex gap-1.5 flex-wrap">
+                        {chatFiles.map((f, i) => (
+                          <span key={i} className="inline-flex items-center gap-1.5 pl-2.5 pr-1 py-1 rounded-lg bg-white border border-gray-200 text-xs text-[#374151] shadow-sm">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#D97706" strokeWidth="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                            {f.name}
+                            <button onClick={() => setChatFiles((prev) => prev.filter((_, j) => j !== i))} className="p-0.5 hover:bg-gray-100 rounded">
+                              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#9CA3AF" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Input area */}
+                  <div className="px-6 py-4">
+                    <div className="max-w-2xl mx-auto relative">
+                      {/* @mention autocomplete */}
+                      {showMentionPicker && (filteredMentionAgents.length > 0 || filteredMentionTeams.length > 0) && (
+                        <div className="absolute bottom-full mb-1 left-0 w-64 bg-white rounded-xl shadow-lg border border-gray-100 py-1 z-50 animate-[fadeIn_0.1s_ease] max-h-72 overflow-y-auto">
+                          {filteredMentionAgents.map((agent, idx) => (
+                            <button
+                              key={`a-${agent.id}`}
+                              onClick={() => insertMention(agent.name)}
+                              onMouseEnter={() => setMentionIndex(idx)}
+                              className={`w-full text-left px-3 py-2 flex items-center gap-2.5 transition ${
+                                idx === mentionIndex ? "bg-[#D97706]/5" : "hover:bg-[#FAF9F6]"
+                              }`}
+                            >
+                              <img src={avatarUrl(agent.name)} alt="" className="w-7 h-7 rounded-full" />
+                              <div className="flex-1 min-w-0">
+                                <div className="text-sm font-medium text-[#374151]">{agent.name}</div>
+                                <div className="text-[10px] text-[#9CA3AF] truncate">{agent.role}</div>
+                              </div>
+                              {idx === mentionIndex && (
+                                <span className="text-[9px] text-[#B0B0A8] flex-shrink-0">Enter</span>
+                              )}
+                            </button>
+                          ))}
+                          {filteredMentionTeams.length > 0 && filteredMentionAgents.length > 0 && (
+                            <div className="px-3 py-1 text-[9px] text-[#B0B0A8] uppercase tracking-wider border-t border-gray-100 mt-0.5 pt-1.5">
+                              {lang === "ko" ? "팀" : "Teams"}
+                            </div>
+                          )}
+                          {filteredMentionTeams.map((team, idx) => {
+                            const globalIdx = filteredMentionAgents.length + idx;
+                            const memberCount = team.members.length;
+                            return (
+                              <button
+                                key={`t-${team.id}`}
+                                onClick={() => insertMention(team.name)}
+                                onMouseEnter={() => setMentionIndex(globalIdx)}
+                                className={`w-full text-left px-3 py-2 flex items-center gap-2.5 transition ${
+                                  globalIdx === mentionIndex ? "bg-[#D97706]/5" : "hover:bg-[#FAF9F6]"
+                                }`}
+                              >
+                                <div className="w-7 h-7 rounded-full bg-gradient-to-br from-[#D97706] to-[#B45309] flex items-center justify-center flex-shrink-0">
+                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <div className="text-sm font-medium text-[#374151]">{team.name}</div>
+                                  <div className="text-[10px] text-[#9CA3AF] truncate">{lang === "ko" ? `팀 · ${memberCount}명` : `Team · ${memberCount} members`}</div>
+                                </div>
+                                {globalIdx === mentionIndex && (
+                                  <span className="text-[9px] text-[#B0B0A8] flex-shrink-0">Enter</span>
+                                )}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                      <form onSubmit={(e) => { e.preventDefault(); handleChatSend(); }} className="flex items-end gap-2">
+                        <div className="flex-1 flex items-end bg-white rounded-xl border border-gray-200 shadow-sm focus-within:border-[#D97706] focus-within:shadow-[0_0_0_1px_rgba(217,119,6,0.1)] transition">
+                          <button
+                            type="button"
+                            onClick={() => fileInputRef.current?.click()}
+                            className="px-3 py-2.5 text-[#9CA3AF] hover:text-[#D97706] transition flex-shrink-0"
+                            title={lang === "ko" ? "파일 첨부" : "Attach file"}
+                          >
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                            </svg>
+                          </button>
+                          <input type="file" ref={fileInputRef} className="hidden" multiple onChange={(e) => handleFileUpload(e.target.files)} />
+                          <input
+                            ref={chatInputRef}
+                            type="text"
+                            value={prompt}
+                            onChange={(e) => handleChatInputChange(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (!showMentionPicker) return;
+                              const allMentionItems = [...filteredMentionAgents.map((a) => a.name), ...filteredMentionTeams.map((t) => t.name)];
+                              if (e.key === "Escape") { setShowMentionPicker(false); e.preventDefault(); return; }
+                              if (e.key === "ArrowDown") { e.preventDefault(); setMentionIndex((i) => Math.min(i + 1, allMentionItems.length - 1)); return; }
+                              if (e.key === "ArrowUp") { e.preventDefault(); setMentionIndex((i) => Math.max(i - 1, 0)); return; }
+                              if ((e.key === "Enter" || e.key === "Tab") && allMentionItems.length > 0) {
+                                e.preventDefault();
+                                insertMention(allMentionItems[mentionIndex] || allMentionItems[0]);
+                              }
+                            }}
+                            placeholder={(() => {
+                              const lastAgent = activeConvo?.lastAgentId ? activeAgents.find((a) => a.id === activeConvo.lastAgentId) : null;
+                              if (lastAgent) return lang === "ko" ? `${lastAgent.name}에게 메시지...` : `Message ${lastAgent.name}...`;
+                              return lang === "ko" ? `@${activeAgents[0]?.name || "팀원"} 또는 @${agentTeams[0]?.name || "팀"} 메시지 입력...` : `@${activeAgents[0]?.name || "agent"} or @${agentTeams[0]?.name || "team"} type a message...`;
+                            })()}
+                            className="flex-1 px-1 py-2.5 text-sm bg-transparent focus:outline-none placeholder:text-[#C4C4C0]"
+                          />
+                          {chatRunningAgent ? (
+                            <button
+                              type="button"
+                              onClick={async () => { try { await invoke("cancel_agent"); } catch {} }}
+                              className="px-3 py-2.5 text-red-400 hover:text-red-600 transition flex-shrink-0"
+                              title={lang === "ko" ? "중지" : "Stop"}
+                            >
+                              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                                <rect x="4" y="4" width="16" height="16" rx="2" />
+                              </svg>
+                            </button>
+                          ) : (
+                            <button
+                              type="submit"
+                              disabled={!prompt.trim()}
+                              className="px-3 py-2.5 text-[#9CA3AF] hover:text-[#D97706] disabled:opacity-30 transition flex-shrink-0"
+                            >
+                              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </form>
+                    </div>
+                  </div>
+                </>
+              )}
           </div>
         )}
 
@@ -1573,40 +2880,198 @@ ${hasBash ? `
                       />
                     </div>
 
-                    <TagSelector
-                      label={lang === "ko" ? "이 팀원이 할 수 있는 일" : "What this member can do"}
-                      hint={lang === "ko" ? "클릭하여 켜거나 끄세요. 잘 모르시면 기본값 그대로 두셔도 됩니다." : "Click to toggle. Leave as-is if unsure."}
-                      available={ALL_TOOLS}
-                      selected={agentFormTools}
-                      onChange={setAgentFormTools}
+                    <PermissionSelector
+                      label={lang === "ko" ? "이 팀원에게 허용할 권한" : "Permissions for this member"}
+                      hint={lang === "ko" ? "체크하면 해당 기능을 사용할 수 있습니다. 잘 모르시면 기본값 그대로 두세요." : "Check to allow. Leave defaults if unsure."}
+                      selected={agentFormPermissions}
+                      onChange={setAgentFormPermissions}
                       lang={lang}
-                    />
-                    <TagSelector
-                      label={lang === "ko" ? "이 팀원이 하면 안 되는 일" : "What this member must NOT do"}
-                      hint={lang === "ko" ? "잘못 사용하면 안 되는 기능을 선택하세요." : "Select capabilities to restrict."}
-                      available={ALL_TOOLS}
-                      selected={agentFormNotAllowed}
-                      onChange={setAgentFormNotAllowed}
-                      lang={lang}
+                      hasGws={enabledIntegrations.includes("gws")}
                     />
 
-                    <div>
-                      <label className="text-xs font-medium text-[#6B7280] block mb-1">
-                        {lang === "ko" ? "Discord 자동응답 채널" : "Discord Auto-reply Channels"}
-                      </label>
-                      <input
-                        type="text"
-                        placeholder={lang === "ko" ? "채널 ID를 입력하세요 (쉼표로 구분)" : "Enter channel IDs (comma-separated)"}
-                        value={agentFormChannels}
-                        onChange={(e) => setAgentFormChannels(e.target.value)}
-                        className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded focus:outline-none focus:border-[#D97706] font-mono text-xs"
-                      />
-                      <p className="text-[10px] text-[#9CA3AF] mt-1 leading-relaxed">
-                        {lang === "ko"
-                          ? "채널 ID 찾는 법: Discord 설정 → 고급 → 개발자 모드 켜기 → 채널 우클릭 → \"채널 ID 복사\""
-                          : "Finding channel ID: Discord Settings → Advanced → Developer Mode ON → Right-click channel → Copy Channel ID"}
-                      </p>
-                    </div>
+                    {/* Advanced SDK settings — collapsible */}
+                    <details className="rounded-xl border border-gray-200 group/adv overflow-hidden">
+                      <summary className="px-4 py-3 cursor-pointer select-none flex items-center justify-between bg-white hover:bg-gray-50/80 transition list-none [&::-webkit-details-marker]:hidden">
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-6 h-6 rounded-md bg-gray-100 group-open/adv:bg-[#D97706]/10 flex items-center justify-center transition">
+                            <svg className="w-3.5 h-3.5 text-[#9CA3AF] group-open/adv:text-[#D97706] transition" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                          </div>
+                          <div>
+                            <span className="text-xs font-medium text-[#374151]">
+                              {lang === "ko" ? "고급 설정" : "Advanced Settings"}
+                            </span>
+                            {/* Active settings summary */}
+                            {(() => {
+                              const tags: string[] = [];
+                              if (agentFormReduceHallucinations) tags.push(lang === "ko" ? "거짓말 방지" : "Anti-false");
+                              if (agentFormEffort) tags.push(agentFormEffort === "low" ? (lang === "ko" ? "빠름" : "Quick") : agentFormEffort === "high" ? (lang === "ko" ? "깊이" : "Deep") : (lang === "ko" ? "보통" : "Balanced"));
+                              if (agentFormMaxTurns) tags.push(`${agentFormMaxTurns} turns`);
+                              if (agentFormMaxBudget) tags.push(`$${agentFormMaxBudget}`);
+                              return tags.length > 0 ? (
+                                <span className="text-[10px] text-[#D97706] ml-1.5">{tags.join(" · ")}</span>
+                              ) : (
+                                <span className="text-[10px] text-[#B0B0A8] ml-1.5 group-open/adv:hidden">{lang === "ko" ? "옵션 없음" : "None"}</span>
+                              );
+                            })()}
+                          </div>
+                        </div>
+                        <svg className="w-3.5 h-3.5 text-[#B0B0A8] transition-transform group-open/adv:rotate-180 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 12 15 18 9"/></svg>
+                      </summary>
+
+                      <div className="bg-[#FAFAF8] border-t border-gray-100">
+                        {/* Anti-hallucination toggle */}
+                        <button
+                          type="button"
+                          onClick={() => setAgentFormReduceHallucinations(!agentFormReduceHallucinations)}
+                          className={`w-full flex items-center gap-3 px-4 py-3 text-left transition border-b border-gray-100 ${
+                            agentFormReduceHallucinations ? "bg-[#D97706]/[0.03]" : "hover:bg-white/60"
+                          }`}
+                        >
+                          <div className={`flex-shrink-0 w-[18px] h-[18px] rounded-[5px] border-2 flex items-center justify-center transition ${
+                            agentFormReduceHallucinations
+                              ? "bg-[#D97706] border-[#D97706]"
+                              : "border-gray-300 bg-white"
+                          }`}>
+                            {agentFormReduceHallucinations && (
+                              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="text-xs font-medium text-[#374151]">
+                              {lang === "ko" ? "거짓말 방지" : "Prevent False Info"}
+                            </div>
+                            <div className="text-[10px] text-[#9CA3AF] leading-snug">
+                              {lang === "ko"
+                                ? "모르면 모른다고 답변 · 출처 필수 · 추측 금지"
+                                : "Say \"I don't know\" · Cite sources · No guessing"}
+                            </div>
+                          </div>
+                        </button>
+
+                        {/* Effort level */}
+                        <div className="px-4 py-3 border-b border-gray-100">
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="text-xs font-medium text-[#374151]">
+                              {lang === "ko" ? "작업 강도" : "Effort Level"}
+                            </span>
+                            {agentFormEffort && (
+                              <button type="button" onClick={() => setAgentFormEffort("")} className="text-[10px] text-[#9CA3AF] hover:text-[#374151]">
+                                {lang === "ko" ? "초기화" : "Reset"}
+                              </button>
+                            )}
+                          </div>
+                          <div className="grid grid-cols-4 gap-1.5">
+                            {([
+                              { value: "", label: lang === "ko" ? "자동" : "Auto", desc: lang === "ko" ? "기본" : "Default" },
+                              { value: "low", label: lang === "ko" ? "빠름" : "Quick", desc: lang === "ko" ? "간단한 답변" : "Simple" },
+                              { value: "medium", label: lang === "ko" ? "보통" : "Medium", desc: lang === "ko" ? "균형" : "Balanced" },
+                              { value: "high", label: lang === "ko" ? "깊이" : "Deep", desc: lang === "ko" ? "철저한 분석" : "Thorough" },
+                            ] as const).map((opt) => (
+                              <button
+                                key={opt.value}
+                                type="button"
+                                onClick={() => setAgentFormEffort(opt.value as any)}
+                                className={`px-1 py-2 rounded-lg text-center transition ${
+                                  agentFormEffort === opt.value
+                                    ? "bg-[#D97706] text-white shadow-sm"
+                                    : "bg-white text-[#6B7280] border border-gray-200 hover:border-[#D97706]/30"
+                                }`}
+                              >
+                                <div className="text-[11px] font-medium">{opt.label}</div>
+                                <div className={`text-[9px] mt-0.5 ${agentFormEffort === opt.value ? "text-white/70" : "text-[#B0B0A8]"}`}>{opt.desc}</div>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Limits */}
+                        <div className="px-4 py-3">
+                          <span className="text-xs font-medium text-[#374151] block mb-2">
+                            {lang === "ko" ? "사용 제한" : "Usage Limits"}
+                          </span>
+                          <div className="flex gap-3">
+                            <div className="flex-1">
+                              <div className="flex items-center gap-1.5 mb-1">
+                                <svg className="w-3 h-3 text-[#9CA3AF]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+                                <label className="text-[10px] text-[#6B7280]">{lang === "ko" ? "최대 턴" : "Max Turns"}</label>
+                              </div>
+                              <div className="relative">
+                                <input
+                                  type="number"
+                                  placeholder="-"
+                                  value={agentFormMaxTurns}
+                                  onChange={(e) => setAgentFormMaxTurns(e.target.value)}
+                                  min="1"
+                                  max="100"
+                                  className="w-full px-2.5 py-1.5 text-xs bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-[#D97706] text-center"
+                                />
+                                {agentFormMaxTurns && (
+                                  <button type="button" onClick={() => setAgentFormMaxTurns("")} className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[#B0B0A8] hover:text-[#374151]">
+                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex-1">
+                              <div className="flex items-center gap-1.5 mb-1">
+                                <svg className="w-3 h-3 text-[#9CA3AF]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                                <label className="text-[10px] text-[#6B7280]">{lang === "ko" ? "비용 한도" : "Budget Cap"}</label>
+                              </div>
+                              <div className="relative">
+                                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[10px] text-[#B0B0A8]">$</span>
+                                <input
+                                  type="number"
+                                  placeholder="-"
+                                  value={agentFormMaxBudget}
+                                  onChange={(e) => setAgentFormMaxBudget(e.target.value)}
+                                  min="0.01"
+                                  step="0.01"
+                                  className="w-full pl-5 pr-2 py-1.5 text-xs bg-white border border-gray-200 rounded-lg focus:outline-none focus:border-[#D97706] text-center"
+                                />
+                                {agentFormMaxBudget && (
+                                  <button type="button" onClick={() => setAgentFormMaxBudget("")} className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[#B0B0A8] hover:text-[#374151]">
+                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                          <p className="text-[9px] text-[#B0B0A8] mt-1.5 text-center">
+                            {lang === "ko" ? "비어있으면 제한 없음" : "Leave empty for unlimited"}
+                          </p>
+                        </div>
+                      </div>
+                    </details>
+
+                    {enabledIntegrations.includes("discord") && (
+                      <div className="p-3 rounded-lg border border-gray-200 bg-gray-50/50">
+                        <label className="text-xs font-medium text-[#374151] block mb-0.5">
+                          {lang === "ko" ? "Discord 자동응답" : "Discord Auto-reply"}
+                        </label>
+                        <p className="text-[10px] text-[#6B7280] mb-2 leading-relaxed">
+                          {lang === "ko"
+                            ? "지정한 채널에 누군가 글을 쓰면, @태그 없이도 이 팀원이 자동으로 응답합니다."
+                            : "This member will automatically reply to any message in the specified channels, without needing an @mention."}
+                        </p>
+                        <input
+                          type="text"
+                          placeholder={lang === "ko" ? "채널 ID (쉼표로 구분)" : "Channel IDs (comma-separated)"}
+                          value={agentFormChannels}
+                          onChange={(e) => setAgentFormChannels(e.target.value)}
+                          className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded focus:outline-none focus:border-[#D97706] font-mono text-xs"
+                        />
+                        <details className="mt-1.5">
+                          <summary className="text-[10px] text-[#9CA3AF] cursor-pointer hover:text-[#6B7280]">
+                            {lang === "ko" ? "채널 ID는 어디서 찾나요?" : "Where to find channel ID?"}
+                          </summary>
+                          <p className="text-[10px] text-[#9CA3AF] mt-1 pl-2 border-l-2 border-gray-200 leading-relaxed">
+                            {lang === "ko"
+                              ? "Discord 설정 → 고급 → 개발자 모드 켜기 → 채널 우클릭 → \"채널 ID 복사\""
+                              : "Discord Settings → Advanced → Developer Mode ON → Right-click channel → Copy Channel ID"}
+                          </p>
+                        </details>
+                      </div>
+                    )}
 
                     <div className="flex gap-2 pt-2">
                       <button
@@ -1664,19 +3129,18 @@ ${hasBash ? `
                           <span className="text-xs text-[#6B7280]">{agent.role}</span>
                         </div>
                         <div className="mt-2 flex flex-wrap gap-1">
-                        {agent.tools.map((tl) => (
-                          <span key={tl} className="px-1.5 py-0.5 text-[10px] bg-[#F5F0E8] text-[#8B7355] rounded">
-                            {toolLabel(tl, lang)}
-                          </span>
-                        ))}
-                        {agent.not_allowed.map((tl) => (
-                          <span key={tl} className="px-1.5 py-0.5 text-[10px] bg-gray-100 text-gray-400 rounded line-through">
-                            {toolLabel(tl, lang)}
-                          </span>
-                        ))}
+                        {sdkToolsToPermissionGroups(agent.tools, enabledIntegrations.includes("gws")).map((gid) => {
+                          const g = PERMISSION_GROUPS.find((p) => p.id === gid);
+                          return g ? (
+                            <span key={gid} className="px-1.5 py-0.5 text-[10px] bg-[#F5F0E8] text-[#8B7355] rounded">
+                              {g[lang]}
+                            </span>
+                          ) : null;
+                        })}
                         {agent.channels && agent.channels.length > 0 && (
-                          <span className="px-1.5 py-0.5 text-[10px] bg-[#F5F0E8] text-[#8B7355] rounded">
-                            Discord {agent.channels.length}{lang === "ko" ? "개 채널" : " channels"}
+                          <span className="px-1.5 py-0.5 text-[10px] bg-indigo-50 text-indigo-500 rounded flex items-center gap-0.5">
+                            <svg width="10" height="8" viewBox="0 0 71 55" className="flex-shrink-0"><path d="M60.1 4.9A58.5 58.5 0 0 0 45.4.2a.2.2 0 0 0-.2.1 40.8 40.8 0 0 0-1.8 3.7 53.9 53.9 0 0 0-16.2 0A37.3 37.3 0 0 0 25.4.3a.2.2 0 0 0-.2-.1A58.4 58.4 0 0 0 10.6 4.9C1.5 18.7-.9 32.2.3 45.5a58.7 58.7 0 0 0 17.7 9 42 42 0 0 0 3.6-5.9 38.6 38.6 0 0 1-5.5-2.6c.4-.3.7-.6 1.1-.9a.2.2 0 0 1 .2 0c11.6 5.3 24.1 5.3 35.5 0a.2.2 0 0 1 .2 0l1.1.9c-1.8 1-3.6 1.9-5.5 2.6a47.2 47.2 0 0 0 3.6 5.9A58.5 58.5 0 0 0 70.7 45.6c1.4-15-2.3-28.4-9.8-40.1z" fill="currentColor"/></svg>
+                            {lang === "ko" ? "자동응답" : "Auto-reply"} {agent.channels.length}{lang === "ko" ? "채널" : "ch"}
                           </span>
                         )}
                       </div>
@@ -1701,12 +3165,12 @@ ${hasBash ? `
                               {msg.role === "agent" && (
                                 <img src={avatarUrl(agent.name)} alt="" className="w-6 h-6 rounded-full flex-shrink-0 mt-1" />
                               )}
-                              <div className={`max-w-[80%] px-3 py-2 rounded-lg text-sm whitespace-pre-wrap ${
+                              <div className={`max-w-[80%] px-3 py-2 rounded-lg text-sm ${
                                 msg.role === "user"
-                                  ? "bg-[#D97706] text-white rounded-br-sm"
+                                  ? "bg-[#D97706] text-white rounded-br-sm whitespace-pre-wrap"
                                   : "bg-gray-50 text-[#1A1A1A] border border-gray-200 rounded-bl-sm"
                               }`}>
-                                {msg.text}
+                                {msg.role === "agent" ? <MarkdownMessage text={msg.text} /> : msg.text}
                               </div>
                             </div>
                           ))}
@@ -1905,36 +3369,6 @@ ${hasBash ? `
                     />
                   </div>
 
-                  {/* Execution mode with descriptions */}
-                  <div>
-                    <label className="text-xs font-medium text-[#6B7280] block mb-1.5">{t("team.executionMode")}</label>
-                    <div className="grid grid-cols-2 gap-3">
-                      {(["sequential", "parallel"] as const).map((mode) => (
-                        <button
-                          key={mode}
-                          onClick={() => setTeamFormMode(mode)}
-                          className={`p-3 rounded-lg border-2 text-left transition ${
-                            teamFormMode === mode
-                              ? "border-[#D97706] bg-[#D97706]/5"
-                              : "border-gray-200 hover:border-gray-300"
-                          }`}
-                        >
-                          <div className="flex items-center gap-2 mb-1">
-                            <span className="text-sm">{mode === "sequential" ? "→" : "⇉"}</span>
-                            <span className={`text-sm font-medium ${teamFormMode === mode ? "text-[#D97706]" : ""}`}>
-                              {mode === "sequential" ? t("team.seqDesc") : t("team.parDesc")}
-                            </span>
-                          </div>
-                          <p className="text-[11px] text-[#6B7280]">
-                            {mode === "sequential"
-                              ? (lang === "ko" ? "첫 번째 팀원이 하고, 그 결과를 다음 팀원이 이어받아 합니다" : "First member works, then passes results to the next")
-                              : (lang === "ko" ? "모든 팀원이 동시에 일하고, 리드가 결과를 종합합니다" : "All members work at the same time, lead combines the results")}
-                          </p>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
                   {/* Member selection */}
                   <div>
                     <label className="text-xs font-medium text-[#6B7280] block mb-1.5">
@@ -2001,84 +3435,23 @@ ${hasBash ? `
                                 </div>
                               </div>
                             </div>
-                            {/* Condition & Approval — only for selected members in sequential mode */}
-                            {isSelected && teamFormMode === "sequential" && idx > 0 && (
-                              <div className="mt-1 ml-4 relative" onClick={(e) => e.stopPropagation()}>
-                                {/* Visual connector line */}
-                                <div className="absolute left-4 -top-1 w-px h-1 bg-gray-200" />
-                                <div className="border border-dashed border-gray-200 rounded-lg p-3 bg-gray-50/70">
-                                  <div className="text-[10px] font-medium text-[#9CA3AF] mb-2 flex items-center gap-1.5">
-                                    <span className="w-4 h-4 rounded-full bg-[#D97706]/10 flex items-center justify-center text-[8px] font-bold text-[#D97706]">?</span>
-                                    {lang === "ko" ? "실행 조건" : "Run condition"}
+                            {/* Approval gate — for selected non-lead members */}
+                            {isSelected && !isLead && (
+                              <div className="mt-1 ml-4" onClick={(e) => e.stopPropagation()}>
+                                <label className="flex items-center gap-2 cursor-pointer">
+                                  <div className={`relative w-8 h-[18px] rounded-full transition-colors ${
+                                    teamFormApprovals[agent.id] ? "bg-[#D97706]" : "bg-gray-200"
+                                  }`}
+                                    onClick={() => setTeamFormApprovals({ ...teamFormApprovals, [agent.id]: !teamFormApprovals[agent.id] })}
+                                  >
+                                    <span className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform ${
+                                      teamFormApprovals[agent.id] ? "left-[16px]" : "left-[2px]"
+                                    }`} />
                                   </div>
-                                  <div className="space-y-2.5">
-                                    {/* Condition selector */}
-                                    <div className="flex flex-wrap gap-1.5">
-                                      {[
-                                        { value: "", label: lang === "ko" ? "항상 실행" : "Always run", icon: "—" },
-                                        { value: "result_contains:", label: lang === "ko" ? "특정 단어가 있으면" : "If result includes...", icon: "=" },
-                                        { value: "result_not_contains:", label: lang === "ko" ? "특정 단어가 없으면" : "If result doesn't include...", icon: "≠" },
-                                      ].map((opt) => {
-                                        const currentVal = teamFormConditions[agent.id] || "";
-                                        const isActive = opt.value === "" ? currentVal === "" : currentVal.startsWith(opt.value);
-                                        return (
-                                          <button
-                                            key={opt.value}
-                                            onClick={() => setTeamFormConditions({ ...teamFormConditions, [agent.id]: opt.value })}
-                                            className={`px-2.5 py-1.5 text-[11px] rounded-md border transition flex items-center gap-1.5 ${
-                                              isActive
-                                                ? "border-[#D97706] bg-[#D97706]/5 text-[#D97706] font-medium"
-                                                : "border-gray-200 bg-white text-[#6B7280] hover:border-gray-300"
-                                            }`}
-                                          >
-                                            <span className="text-[10px]">{opt.icon}</span>
-                                            {opt.label}
-                                          </button>
-                                        );
-                                      })}
-                                    </div>
-                                    {/* Keyword input */}
-                                    {(teamFormConditions[agent.id] || "").includes(":") && (
-                                      <div className="flex items-center gap-2">
-                                        <span className="text-[10px] text-[#9CA3AF]">{lang === "ko" ? "키워드:" : "Keyword:"}</span>
-                                        <input
-                                          type="text"
-                                          placeholder={lang === "ko" ? "예: 긴급, 완료, 오류..." : "e.g. urgent, done, error..."}
-                                          value={(teamFormConditions[agent.id] || "").split(":").slice(1).join(":")}
-                                          onChange={(e) => {
-                                            const prefix = (teamFormConditions[agent.id] || "").split(":")[0] + ":";
-                                            setTeamFormConditions({ ...teamFormConditions, [agent.id]: prefix + e.target.value });
-                                          }}
-                                          className="flex-1 text-[11px] px-2.5 py-1.5 border border-gray-200 rounded-md bg-white focus:outline-none focus:border-[#D97706]"
-                                        />
-                                      </div>
-                                    )}
-                                    {/* Approval gate */}
-                                    <div className="pt-2 border-t border-gray-200/60">
-                                      <label className="flex items-center gap-2 cursor-pointer group">
-                                        <div className={`relative w-8 h-[18px] rounded-full transition-colors ${
-                                          teamFormApprovals[agent.id] ? "bg-[#D97706]" : "bg-gray-200"
-                                        }`}
-                                          onClick={() => setTeamFormApprovals({ ...teamFormApprovals, [agent.id]: !teamFormApprovals[agent.id] })}
-                                        >
-                                          <span className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform ${
-                                            teamFormApprovals[agent.id] ? "left-[16px]" : "left-[2px]"
-                                          }`} />
-                                        </div>
-                                        <div>
-                                          <span className="text-[11px] font-medium text-[#374151]">
-                                            {lang === "ko" ? "내 승인 후 실행" : "Need my approval"}
-                                          </span>
-                                          <p className="text-[10px] text-[#9CA3AF]">
-                                            {lang === "ko"
-                                              ? "이전 팀원의 결과를 확인한 뒤 넘길 수 있어요"
-                                              : "Review the previous member's work before passing it on"}
-                                          </p>
-                                        </div>
-                                      </label>
-                                    </div>
-                                  </div>
-                                </div>
+                                  <span className="text-[11px] font-medium text-[#374151]">
+                                    {lang === "ko" ? "승인 필요" : "Requires approval"}
+                                  </span>
+                                </label>
                               </div>
                             )}
                             </div>
@@ -2087,56 +3460,6 @@ ${hasBash ? `
                       </div>
                     )}
                   </div>
-
-                  {/* Visual flow preview */}
-                  {teamFormMembers.length > 0 && (
-                    <div className="p-3 bg-gray-50 rounded-lg">
-                      <div className="text-[10px] font-medium text-[#6B7280] mb-2">
-                        {lang === "ko" ? "실행 흐름 미리보기" : "Execution Flow Preview"}
-                      </div>
-                      <div className="flex items-center gap-1 flex-wrap">
-                        {teamFormMembers.map((id, i) => {
-                          const agent = activeAgents.find((a) => a.id === id);
-                          const isLead = teamFormLead === id;
-                          if (!agent) return null;
-                          const cond = teamFormConditions[id] || "";
-                          const hasCondition = cond.includes(":");
-                          const needsApproval = teamFormApprovals[id] || false;
-                          return (
-                            <span key={id} className="flex items-center gap-1">
-                              {/* Show condition/approval badges between members in sequential mode */}
-                              {teamFormMode === "sequential" && i > 0 && (hasCondition || needsApproval) && (
-                                <span className="flex items-center gap-0.5 mx-0.5">
-                                  {hasCondition && (
-                                    <span className="text-[8px] px-1 py-0.5 bg-blue-50 text-blue-500 rounded font-mono font-bold" title={cond}>
-                                      {cond.startsWith("result_contains:") ? "=" : "≠"}
-                                    </span>
-                                  )}
-                                  {needsApproval && (
-                                    <span className="text-[8px] px-1 py-0.5 bg-amber-50 text-amber-600 rounded font-medium">
-                                      OK?
-                                    </span>
-                                  )}
-                                </span>
-                              )}
-                              <span className={`flex items-center gap-1 px-2 py-1 text-xs rounded-md ${
-                                isLead ? "bg-[#D97706]/10 text-[#D97706] font-medium" : "bg-white border border-gray-200"
-                              }`}>
-                                <img src={avatarUrl(agent.name)} alt="" className="w-4 h-4 rounded-full" />
-                                {agent.name}
-                                {isLead && <span className="text-[9px]">★</span>}
-                              </span>
-                              {i < teamFormMembers.length - 1 && (
-                                <span className="text-gray-400 text-xs mx-0.5">
-                                  {teamFormMode === "sequential" ? "→" : "+"}
-                                </span>
-                              )}
-                            </span>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
 
                   <div className="flex gap-2 pt-1">
                     <button onClick={handleCreateTeam} disabled={!teamFormName.trim() || teamFormMembers.length === 0} className="px-4 py-2 text-sm bg-[#D97706] text-white rounded-lg hover:bg-[#B45309] disabled:opacity-50">{t("common.create")}</button>
@@ -2184,11 +3507,6 @@ ${hasBash ? `
                         <div>
                           <div className="flex items-center gap-2">
                             <span className="font-medium">{at.name}</span>
-                            <span className={`px-2 py-0.5 text-[10px] rounded-full ${
-                              at.execution_mode === "sequential" ? "bg-[#F5F0E8] text-[#8B7355]" : "bg-gray-100 text-[#6B7280]"
-                            }`}>
-                              {at.execution_mode === "sequential" ? t("team.sequential") : t("team.parallel")}
-                            </span>
                             {isRunning && (
                               <span className="px-2 py-0.5 text-[10px] rounded-full bg-[#D97706]/10 text-[#D97706] animate-pulse">
                                 {t("member.running")}
@@ -2208,7 +3526,7 @@ ${hasBash ? `
                                   </span>
                                   {i < at.members.length - 1 && (
                                     <span className="mx-1 text-gray-400 text-xs">
-                                      {at.execution_mode === "sequential" ? "→" : "+"}
+                                      {"→"}
                                     </span>
                                   )}
                                 </span>
@@ -2236,15 +3554,15 @@ ${hasBash ? `
                                 {msg.role === "agent" && msg.agentName && (
                                   <img src={avatarUrl(msg.agentName)} alt="" className="w-6 h-6 rounded-full flex-shrink-0 mt-1" />
                                 )}
-                                <div className={`max-w-[80%] px-3 py-2 rounded-lg text-sm whitespace-pre-wrap ${
+                                <div className={`max-w-[80%] px-3 py-2 rounded-lg text-sm ${
                                   msg.role === "user"
-                                    ? "bg-[#D97706] text-white rounded-br-sm"
+                                    ? "bg-[#D97706] text-white rounded-br-sm whitespace-pre-wrap"
                                     : "bg-gray-50 text-[#1A1A1A] border border-gray-200 rounded-bl-sm"
                                 }`}>
                                   {msg.role === "agent" && msg.agentName && (
                                     <div className="text-[10px] text-[#D97706] mb-1 font-medium">{msg.agentName}</div>
                                   )}
-                                  {msg.text}
+                                  {msg.role === "agent" ? <MarkdownMessage text={msg.text} /> : msg.text}
                                 </div>
                               </div>
                             ))}
@@ -2555,6 +3873,31 @@ ${hasBash ? `
         {/* ═══ SETTINGS ═══ */}
         {currentPage === "settings" && (
           <div className="p-6">
+            {/* Update banner */}
+            {updateAvailable && (
+              <div className="mb-4 flex items-center justify-between bg-gradient-to-r from-[#D97706]/10 to-[#B45309]/10 border border-[#D97706]/20 rounded-xl px-4 py-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-full bg-[#D97706] flex items-center justify-center flex-shrink-0">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                  </div>
+                  <div>
+                    <div className="text-sm font-medium text-[#374151]">
+                      {lang === "ko" ? `새 버전 ${updateAvailable.version} 사용 가능` : `Version ${updateAvailable.version} available`}
+                    </div>
+                    {updateAvailable.body && (
+                      <div className="text-xs text-[#6B7280] mt-0.5 line-clamp-1">{updateAvailable.body}</div>
+                    )}
+                  </div>
+                </div>
+                <button
+                  onClick={handleUpdate}
+                  disabled={updating}
+                  className="px-4 py-1.5 bg-[#D97706] text-white text-xs font-medium rounded-lg hover:bg-[#B45309] disabled:opacity-50 transition flex-shrink-0"
+                >
+                  {updating ? (lang === "ko" ? "업데이트 중..." : "Updating...") : (lang === "ko" ? "업데이트" : "Update")}
+                </button>
+              </div>
+            )}
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-lg font-serif font-semibold">{t("settings.title")}</h2>
               {authUser && (
@@ -2573,6 +3916,7 @@ ${hasBash ? `
                 { key: "integrations" as const, ko: "연동", en: "Integrations" },
                 { key: "automation" as const, ko: "자동화", en: "Automation" },
                 { key: "team" as const, ko: "팀 관리", en: "Team" },
+                { key: "memory" as const, ko: "메모리", en: "Memory" },
               ]).map((tab) => (
                 <button
                   key={tab.key}
@@ -2611,6 +3955,140 @@ ${hasBash ? `
                 </div>
               </div>
 
+              {/* Drive Folders */}
+              {enabledIntegrations.includes("gws") && (
+                <div className="p-4 bg-white rounded-lg border border-gray-200">
+                  <h3 className="text-sm font-medium mb-1">Drive {lang === "ko" ? "폴더" : "Folders"}</h3>
+                  <p className="text-[10px] text-[#9CA3AF] mb-3">
+                    {lang === "ko"
+                      ? "자주 사용하는 Google Drive 폴더 링크를 등록하면 팀원이 정확한 위치에 파일을 저장합니다."
+                      : "Paste Google Drive folder links so agents save files to the right location."}
+                  </p>
+
+                  {driveFolders.length > 0 && (
+                    <div className="space-y-1.5 mb-3">
+                      {driveFolders.map((f, i) => (
+                        <div key={i} className="flex items-center gap-2 px-2.5 py-1.5 bg-gray-50 rounded border border-gray-100">
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={f.driveId ? "#3B82F6" : "#D97706"} strokeWidth="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                          <span className="text-xs font-medium text-[#374151] min-w-0 truncate flex-1">{f.label}</span>
+                          {f.driveId && <span className="text-[9px] px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded">{lang === "ko" ? "공유" : "Shared"}</span>}
+                          <button
+                            onClick={() => setDriveFolders((prev) => prev.filter((_, j) => j !== i))}
+                            className="p-0.5 text-[#9CA3AF] hover:text-red-500"
+                          >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="space-y-2 p-2.5 bg-gray-50/50 rounded border border-dashed border-gray-200">
+                    <div className="flex items-center gap-2">
+                      <input id="df-label" type="text" placeholder={lang === "ko" ? "이름 (예: 영업팀 공유)" : "Label"}
+                        className="w-1/3 px-2 py-1.5 text-xs border border-gray-200 rounded bg-white focus:outline-none focus:border-[#D97706]" />
+                      <input id="df-url" type="text" placeholder={lang === "ko" ? "Google Drive 폴더 링크 붙여넣기" : "Paste Google Drive folder link"}
+                        className="flex-1 px-2 py-1.5 text-xs border border-gray-200 rounded bg-white focus:outline-none focus:border-[#D97706]" />
+                      <button
+                        onClick={() => {
+                          const label = (document.getElementById("df-label") as HTMLInputElement).value.trim();
+                          const url = (document.getElementById("df-url") as HTMLInputElement).value.trim();
+                          if (!label || !url) return;
+
+                          // Extract folder ID from various Google Drive URL formats
+                          // drive.google.com/drive/folders/FOLDER_ID
+                          // drive.google.com/drive/u/0/folders/FOLDER_ID
+                          const folderMatch = url.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+                          // Shared drive: drive.google.com/drive/u/0/team-drives/DRIVE_ID or /drive/DRIVE_ID
+                          const driveMatch = url.match(/\/(?:team-drives|drive\/drives)\/([a-zA-Z0-9_-]+)/);
+
+                          const folderId = folderMatch?.[1] || url; // fallback: treat whole input as ID
+                          const driveId = driveMatch?.[1];
+
+                          setDriveFolders((prev) => [...prev, { label, folderId, driveId: driveId || undefined }]);
+                          (document.getElementById("df-label") as HTMLInputElement).value = "";
+                          (document.getElementById("df-url") as HTMLInputElement).value = "";
+                        }}
+                        className="px-3 py-1.5 text-[11px] font-medium text-white bg-[#D97706] rounded hover:bg-[#B45309]"
+                      >
+                        {lang === "ko" ? "추가" : "Add"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Default File Save Path */}
+              <div className="p-4 bg-white rounded-lg border border-gray-200">
+                <h3 className="text-sm font-medium mb-1">{lang === "ko" ? "파일 저장 경로" : "File Save Path"}</h3>
+                <p className="text-[10px] text-[#9CA3AF] mb-2">
+                  {lang === "ko"
+                    ? "팀원이 보고서, 문서 등 파일을 만들 때 이 경로에 저장합니다. 비어있으면 아무 곳에나 저장될 수 있습니다."
+                    : "Agents will save reports and files to this path. If empty, files may be saved anywhere."}
+                </p>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={defaultSavePath}
+                    onChange={(e) => setDefaultSavePath(e.target.value)}
+                    placeholder={lang === "ko" ? "예: ~/Documents/Flaude" : "e.g. ~/Documents/Flaude"}
+                    className="flex-1 px-2.5 py-1.5 text-xs font-mono border border-gray-200 rounded bg-gray-50 focus:outline-none focus:border-[#D97706]"
+                  />
+                  {defaultSavePath && (
+                    <button
+                      onClick={() => setDefaultSavePath("")}
+                      className="p-1.5 text-[#9CA3AF] hover:text-red-500"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                  )}
+                </div>
+                {!defaultSavePath && (
+                  <div className="flex gap-1.5 mt-2">
+                    {[
+                      { label: "~/Documents/Flaude", path: "~/Documents/Flaude" },
+                      { label: "~/Desktop/Flaude", path: "~/Desktop/Flaude" },
+                    ].map((p) => (
+                      <button
+                        key={p.path}
+                        onClick={() => setDefaultSavePath(p.path)}
+                        className="px-2 py-1 text-[10px] text-[#6B7280] border border-gray-200 rounded hover:border-[#D97706] hover:text-[#D97706] transition"
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Data Storage Path */}
+              <div className="p-4 bg-white rounded-lg border border-gray-200">
+                <h3 className="text-sm font-medium mb-1">{lang === "ko" ? "대화 저장 위치" : "Chat Storage Location"}</h3>
+                <p className="text-[10px] text-[#9CA3AF] mb-2">
+                  {lang === "ko" ? "대화 내용, 세션 등이 이 폴더에 저장됩니다." : "Conversations and sessions are stored in this folder."}
+                </p>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={dataDir}
+                    onChange={(e) => setDataDir(e.target.value)}
+                    className="flex-1 px-2.5 py-1.5 text-xs font-mono border border-gray-200 rounded bg-gray-50 focus:outline-none focus:border-[#D97706]"
+                  />
+                  <button
+                    onClick={async () => {
+                      try {
+                        await invoke("set_data_path", { path: dataDir });
+                        const newDir = await invoke<string>("get_data_path");
+                        setDataDir(newDir);
+                      } catch (e) { console.error(e); }
+                    }}
+                    className="px-3 py-1.5 text-[11px] font-medium text-[#D97706] border border-[#D97706]/20 rounded hover:bg-[#D97706]/5"
+                  >
+                    {lang === "ko" ? "변경" : "Change"}
+                  </button>
+                </div>
+              </div>
+
               {/* Server Status */}
               <div className="p-4 bg-white rounded-lg border border-gray-200">
                 <h3 className="text-sm font-medium mb-2">{t("settings.server")}</h3>
@@ -2620,6 +4098,43 @@ ${hasBash ? `
                     {error ? t("settings.disconnected") : t("settings.connected")}
                   </span>
                 </div>
+              </div>
+
+              {/* Discord Link Token */}
+              <div className="p-4 bg-white rounded-lg border border-gray-200">
+                <h3 className="text-sm font-medium mb-2">Discord 연결</h3>
+                <p className="text-xs text-[#6B7280] mb-2">
+                  Discord에서 <code className="bg-gray-100 px-1 rounded">/link</code> 명령어에 아래 토큰을 입력하면 연결됩니다.
+                </p>
+                {getAuthToken() ? (
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 text-xs bg-gray-100 px-2 py-1.5 rounded font-mono text-[#374151] select-all overflow-hidden text-ellipsis">
+                      {getAuthToken()}
+                    </code>
+                    <button
+                      onClick={() => { navigator.clipboard.writeText(getAuthToken()!); }}
+                      className="px-2 py-1.5 text-xs bg-[#D97706] text-white rounded hover:bg-[#B45309] transition shrink-0"
+                    >
+                      복사
+                    </button>
+                  </div>
+                ) : (
+                  <span className="text-xs text-red-500">로그인 후 사용 가능</span>
+                )}
+                <div className="flex justify-between text-xs mt-2">
+                  <span className="text-[#6B7280]">WebSocket</span>
+                  <span className={wsConnected ? "text-[#059669]" : wsError ? "text-red-500" : "text-[#6B7280]"}>
+                    {wsConnected ? "연결됨" : wsError ? `실패: ${wsError}` : "대기 중"}
+                  </span>
+                </div>
+                {!wsConnected && (
+                  <button
+                    onClick={() => connectWebSocket()}
+                    className="mt-2 px-3 py-1 text-xs bg-[#D97706] text-white rounded hover:bg-[#B45309] transition"
+                  >
+                    재연결
+                  </button>
+                )}
               </div>
 
               {/* Skill Library Info */}
@@ -2696,135 +4211,43 @@ ${hasBash ? `
                         <div className="divide-y divide-gray-100">
                           {catIntegrations.map((integ) => {
                             const enabled = enabledIntegrations.includes(integ.id);
-                            const status = integrationStatus[integ.id] || "checking";
-                            const isConnected = status.startsWith("connected");
-                            const needsAuth = status.startsWith("needs_auth");
-                            const isInstalled = isConnected || needsAuth;
-                            const isNotInstalled = status === "not_installed";
-                            const isError = status === "error";
-                            const isBusy = settingUp === integ.id;
-                            const isManaged = integ.setupType === "managed";
-
-                            const dotColor = status === "checking" ? "bg-gray-300 animate-pulse"
-                              : isConnected ? "bg-[#059669]"
-                              : needsAuth ? "bg-[#D97706]"
-                              : isError ? "bg-red-400"
-                              : "bg-gray-300";
-
-                            const statusLabel = status === "checking" ? t("common.checking")
-                              : isConnected ? t("settings.connected")
-                              : needsAuth ? t("common.needsAuth")
-                              : isError ? t("common.error")
-                              : t("common.notInstalled");
-
-                            const handleInstall = async () => {
-                              setSettingUp(integ.id);
-                              setSetupLog(`Installing ${integ.name}...`);
-                              try {
-                                const result = await invoke<string>("setup_integration", { id: integ.id, envVars: null });
-                                setSetupLog(result);
-                                if (!enabled) setEnabledIntegrations([...enabledIntegrations, integ.id]);
-                                const s = await invoke<string>("check_integration", { id: integ.id });
-                                setIntegrationStatus((prev) => ({ ...prev, [integ.id]: s }));
-                              } catch (e) {
-                                setSetupLog(`Error: ${e}`);
-                              } finally {
-                                setSettingUp(null);
-                              }
-                            };
-
-                            const handleAuth = async () => {
-                              setSettingUp(integ.id);
-                              setSetupLog(`Authenticating ${integ.name}...`);
-                              try {
-                                const result = await invoke<string>("auth_integration", { id: integ.id });
-                                setSetupLog(result);
-                                if (!enabled) setEnabledIntegrations([...enabledIntegrations, integ.id]);
-                                setTimeout(async () => {
-                                  const s = await invoke<string>("check_integration", { id: integ.id });
-                                  setIntegrationStatus((prev) => ({ ...prev, [integ.id]: s }));
-                                }, 3000);
-                              } catch (e) {
-                                setSetupLog(`Error: ${e}`);
-                              } finally {
-                                setSettingUp(null);
-                              }
-                            };
 
                             return (
                               <div key={integ.id} className="px-4 py-3 hover:bg-gray-50/50 transition">
                                 <div className="flex items-center gap-3">
                                   <div className={`w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                                    isConnected ? "bg-[#059669]/5" : "bg-gray-50"
+                                    enabled ? "bg-[#D97706]/5" : "bg-gray-50"
                                   }`}>
                                     <IntegrationLogo id={integ.id} size={22} />
                                   </div>
 
                                   <div className="flex-1 min-w-0">
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex items-center gap-1.5">
                                       <span className="text-[13px] font-medium text-[#1A1A1A]">{integ.name}</span>
-                                      <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
-                                      <span className="text-[11px] text-[#6B7280]">{statusLabel}</span>
+                                      {integ.id === "slack" && (
+                                        <span className="px-1.5 py-0.5 text-[9px] font-medium bg-violet-100 text-violet-600 rounded-full">Beta</span>
+                                      )}
                                     </div>
+                                    <p className="text-[11px] text-[#9CA3AF] mt-0.5">{integ.description}</p>
                                   </div>
 
-                                  <div className="flex items-center gap-2 flex-shrink-0">
-                                    {isManaged && integ.inviteUrl && (
-                                      <a
-                                        href={integ.inviteUrl}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="px-3 py-1.5 text-[11px] font-medium text-[#5865F2] border border-[#5865F2]/20 rounded-md hover:bg-[#5865F2]/5 transition"
-                                      >
-                                        {t("settings.addToServer")}
-                                      </a>
-                                    )}
-
-                                    {!isManaged && (isNotInstalled || isError) && (
-                                      <button
-                                        onClick={handleInstall}
-                                        disabled={isBusy || settingUp !== null}
-                                        className="px-3 py-1.5 text-[11px] font-medium text-[#D97706] border border-[#D97706]/20 rounded-md hover:bg-[#D97706]/5 disabled:opacity-50 transition"
-                                      >
-                                        {isBusy ? "..." : t("settings.install")}
-                                      </button>
-                                    )}
-
-                                    {!isManaged && needsAuth && (
-                                      <button
-                                        onClick={handleAuth}
-                                        disabled={isBusy || settingUp !== null}
-                                        className="px-3 py-1.5 text-[11px] font-medium text-[#D97706] border border-[#D97706]/20 rounded-md hover:bg-[#D97706]/5 disabled:opacity-50 transition"
-                                      >
-                                        {isBusy ? "..." : t("settings.connect")}
-                                      </button>
-                                    )}
-
-                                    {!isManaged && isConnected && (
-                                      <span className="text-[11px] font-medium text-[#059669]">{t("settings.ready")}</span>
-                                    )}
-
-                                    {(isInstalled || isManaged) && (
-                                      <button
-                                        onClick={() =>
-                                          setEnabledIntegrations(
-                                            enabled
-                                              ? enabledIntegrations.filter((i) => i !== integ.id)
-                                              : [...enabledIntegrations, integ.id]
-                                          )
-                                        }
-                                        className={`relative w-8 h-[18px] rounded-full transition-colors ${
-                                          enabled ? "bg-[#D97706]" : "bg-gray-200"
-                                        }`}
-                                      >
-                                        <span className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform ${
-                                          enabled ? "left-[16px]" : "left-[2px]"
-                                        }`} />
-                                      </button>
-                                    )}
-                                  </div>
+                                  <button
+                                    onClick={() =>
+                                      setEnabledIntegrations(
+                                        enabled
+                                          ? enabledIntegrations.filter((i) => i !== integ.id)
+                                          : [...enabledIntegrations, integ.id]
+                                      )
+                                    }
+                                    className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
+                                      enabled ? "bg-[#D97706]" : "bg-gray-200"
+                                    }`}
+                                  >
+                                    <span className={`absolute top-[3px] w-[14px] h-[14px] rounded-full bg-white shadow-sm transition-transform ${
+                                      enabled ? "left-[19px]" : "left-[3px]"
+                                    }`} />
+                                  </button>
                                 </div>
-
                               </div>
                             );
                           })}
@@ -3218,6 +4641,177 @@ ${hasBash ? `
                 </div>
               </div>
 
+              </>)}
+
+              {/* ── Memory Tab ── */}
+              {settingsTab === "memory" && (<>
+              {/* Toggle + Info */}
+              <div className="p-4 bg-white rounded-lg border border-gray-200">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <h3 className="text-sm font-medium text-[#1A1A1A]">{lang === "ko" ? "지식 메모리" : "Knowledge Memory"}</h3>
+                    <p className="text-xs text-[#6B7280] mt-0.5">{lang === "ko" ? "대화에서 중요한 정보를 자동 추출하여 저장합니다" : "Auto-extracts important info from conversations"}</p>
+                  </div>
+                  <button
+                    onClick={() => setMemoryEnabled(!memoryEnabled)}
+                    className={`relative w-10 h-5 rounded-full transition ${memoryEnabled ? "bg-[#1A1A1A]" : "bg-gray-300"}`}
+                  >
+                    <span className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition ${memoryEnabled ? "left-5" : "left-0.5"}`} />
+                  </button>
+                </div>
+                {memoryEnabled && (
+                  <div className="text-xs text-[#6B7280] bg-gray-50 rounded-md p-2.5 flex items-start gap-2">
+                    <svg className="w-3.5 h-3.5 mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    <span>{lang === "ko" ? "Sonnet 4.6으로 백그라운드 추출 — 답변 속도 영향 없음" : "Sonnet 4.6 background extraction — no impact on response speed"}</span>
+                  </div>
+                )}
+              </div>
+
+              {knowledgeMemory.length > 0 ? (() => {
+                const categoryIcon: Record<string, string> = { client: "\u{1F464}", project: "\u{1F4C1}", person: "\u{1F9D1}", decision: "\u26A1", fact: "\u{1F4A1}" };
+                const categoryDot: Record<string, string> = { client: "bg-blue-400", project: "bg-purple-400", person: "bg-green-400", decision: "bg-amber-400", fact: "bg-gray-400" };
+                const categoryColor: Record<string, string> = {
+                  client: "bg-blue-50 text-blue-700 border-blue-200",
+                  project: "bg-purple-50 text-purple-700 border-purple-200",
+                  person: "bg-green-50 text-green-700 border-green-200",
+                  decision: "bg-amber-50 text-amber-700 border-amber-200",
+                  fact: "bg-gray-50 text-gray-700 border-gray-200",
+                };
+                const categoryLabel: Record<string, string> = { client: "고객", project: "프로젝트", person: "인물", decision: "결정", fact: "사실" };
+                const categories = ["client", "project", "person", "decision", "fact"] as const;
+                const counts = Object.fromEntries(categories.map((c) => [c, knowledgeMemory.filter((m) => m.category === c).length]));
+
+                // Build relation graph edges
+                const edges: Array<{ from: string; to: string }> = [];
+                knowledgeMemory.forEach((node) => {
+                  if (!node.relations) return;
+                  node.relations.forEach((rel) => {
+                    const target = knowledgeMemory.find((n) => n.subject === rel || n.relations?.includes(node.subject));
+                    if (target && target.id !== node.id) {
+                      const key = [node.id, target.id].sort().join("-");
+                      if (!edges.find((e) => [e.from, e.to].sort().join("-") === key)) {
+                        edges.push({ from: node.id, to: target.id });
+                      }
+                    }
+                  });
+                });
+
+                return (<>
+                {/* Category overview cards */}
+                <div className="grid grid-cols-5 gap-2">
+                  {categories.map((cat) => (
+                    <div key={cat} className="bg-white rounded-lg border border-gray-200 p-3 text-center">
+                      <div className="text-lg mb-0.5">{categoryIcon[cat]}</div>
+                      <div className="text-base font-semibold text-[#1A1A1A]">{counts[cat]}</div>
+                      <div className="text-[10px] text-[#6B7280]">{lang === "ko" ? categoryLabel[cat] : cat}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Mini knowledge graph visualization */}
+                {knowledgeMemory.length >= 2 && (
+                  <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+                    <div className="px-4 py-2.5 border-b border-gray-100">
+                      <h3 className="text-xs font-medium text-[#6B7280]">{lang === "ko" ? "관계 그래프" : "Relation Graph"}</h3>
+                    </div>
+                    <div className="p-4">
+                      <svg viewBox="0 0 600 300" className="w-full h-48">
+                        {/* Draw edges first */}
+                        {edges.map((edge, i) => {
+                          const nodes = knowledgeMemory.slice(-20); // Show last 20
+                          const fromIdx = nodes.findIndex((n) => n.id === edge.from);
+                          const toIdx = nodes.findIndex((n) => n.id === edge.to);
+                          if (fromIdx < 0 || toIdx < 0) return null;
+                          const total = nodes.length;
+                          const fx = 300 + 220 * Math.cos((fromIdx / total) * 2 * Math.PI - Math.PI / 2);
+                          const fy = 150 + 120 * Math.sin((fromIdx / total) * 2 * Math.PI - Math.PI / 2);
+                          const tx = 300 + 220 * Math.cos((toIdx / total) * 2 * Math.PI - Math.PI / 2);
+                          const ty = 150 + 120 * Math.sin((toIdx / total) * 2 * Math.PI - Math.PI / 2);
+                          return <line key={i} x1={fx} y1={fy} x2={tx} y2={ty} stroke="#E5E7EB" strokeWidth="1" />;
+                        })}
+                        {/* Draw nodes */}
+                        {knowledgeMemory.slice(-20).map((node, i, arr) => {
+                          const angle = (i / arr.length) * 2 * Math.PI - Math.PI / 2;
+                          const x = 300 + 220 * Math.cos(angle);
+                          const y = 150 + 120 * Math.sin(angle);
+                          const dotColor: Record<string, string> = { client: "#60A5FA", project: "#A78BFA", person: "#34D399", decision: "#FBBF24", fact: "#9CA3AF" };
+                          const hasEdge = edges.some((e) => e.from === node.id || e.to === node.id);
+                          return (
+                            <g key={node.id}>
+                              <circle cx={x} cy={y} r={hasEdge ? 6 : 4} fill={dotColor[node.category] || "#9CA3AF"} opacity={0.9} />
+                              <text x={x} y={y + 16} textAnchor="middle" className="text-[8px] fill-[#6B7280]" style={{ fontSize: "8px" }}>
+                                {node.subject.length > 8 ? node.subject.slice(0, 8) + ".." : node.subject}
+                              </text>
+                            </g>
+                          );
+                        })}
+                      </svg>
+                    </div>
+                  </div>
+                )}
+
+                {/* Memory list */}
+                <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+                  <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
+                    <h3 className="text-sm font-medium text-[#1A1A1A]">
+                      {lang === "ko" ? `저장된 기억 (${knowledgeMemory.length})` : `Stored memories (${knowledgeMemory.length})`}
+                    </h3>
+                    <button
+                      onClick={() => { if (confirm(lang === "ko" ? "모든 기억을 삭제하시겠습니까?" : "Delete all memories?")) setKnowledgeMemory([]); }}
+                      className="text-xs text-red-500 hover:text-red-700"
+                    >
+                      {lang === "ko" ? "전체 삭제" : "Clear all"}
+                    </button>
+                  </div>
+                  <div className="divide-y divide-gray-50 max-h-80 overflow-y-auto">
+                    {[...knowledgeMemory].reverse().map((mem) => (
+                      <div key={mem.id} className="px-4 py-3 hover:bg-gray-50 group">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${categoryDot[mem.category] || "bg-gray-400"}`} />
+                              <span className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded border ${categoryColor[mem.category] || categoryColor.fact}`}>
+                                {lang === "ko" ? categoryLabel[mem.category] || mem.category : mem.category}
+                              </span>
+                              <span className="text-xs font-medium text-[#1A1A1A] truncate">{mem.subject}</span>
+                            </div>
+                            <p className="text-xs text-[#6B7280] leading-relaxed pl-3.5">{mem.content}</p>
+                            <div className="flex items-center gap-1.5 mt-1.5 pl-3.5 flex-wrap">
+                              <span className="text-[10px] text-[#9CA3AF]">{mem.source}</span>
+                              <span className="text-[10px] text-[#D1D5DB]">|</span>
+                              <span className="text-[10px] text-[#9CA3AF]">{new Date(mem.createdAt).toLocaleDateString()}</span>
+                              {mem.relations && mem.relations.length > 0 && (
+                                <>
+                                  <span className="text-[10px] text-[#D1D5DB]">|</span>
+                                  {mem.relations.map((r, i) => (
+                                    <span key={i} className="text-[10px] bg-gray-100 text-[#6B7280] px-1.5 py-0.5 rounded-full">{r}</span>
+                                  ))}
+                                </>
+                              )}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => setKnowledgeMemory((prev) => prev.filter((m) => m.id !== mem.id))}
+                            className="opacity-0 group-hover:opacity-100 p-1 text-[#9CA3AF] hover:text-red-500 transition"
+                            title={lang === "ko" ? "삭제" : "Delete"}
+                          >
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                </>);
+              })() : (
+                <div className="p-8 bg-white rounded-lg border border-gray-200 text-center">
+                  <div className="w-12 h-12 mx-auto mb-3 bg-gray-100 rounded-full flex items-center justify-center">
+                    <svg className="w-6 h-6 text-[#9CA3AF]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
+                  </div>
+                  <p className="text-sm font-medium text-[#6B7280]">{lang === "ko" ? "아직 저장된 기억이 없습니다" : "No memories stored yet"}</p>
+                  <p className="text-xs text-[#9CA3AF] mt-1">{lang === "ko" ? "대화를 하면 자동으로 중요한 정보가 추출됩니다" : "Important info will be auto-extracted from conversations"}</p>
+                </div>
+              )}
               </>)}
             </div>
           </div>
