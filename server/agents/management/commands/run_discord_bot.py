@@ -9,11 +9,12 @@ Requires:
 
 Features:
     - @agent_name message — Natural message routing (e.g. @ria 안녕)
-    - Thread-based session continuity
+    - Thread-based session continuity (SDK session resume)
     - /agents, /teams, /status, /history, /client, /link, /help
 """
 
 import asyncio
+import json
 import os
 import logging
 from collections import OrderedDict
@@ -26,14 +27,45 @@ from asgiref.sync import sync_to_async
 
 from agents.models import Agent, AgentTeam, Client, UserPlatformLink, ThreadMessage
 from agents.orchestrator import (
-    run_claude, run_team, get_team_agents_with_meta,
+    execute_agent, build_context_prompt,
     get_running_executions, get_execution_history,
     get_pending_approvals, decide_approval, resume_after_approval,
-    auto_advance_client_status,
 )
 from agents.notifier import notify_approval_needed
 
 logger = logging.getLogger("flaude.discord")
+
+
+# ── TTL Cache ────────────────────────────────────────────────
+
+import time as _time
+
+_CACHE_TTL = 30  # seconds
+
+
+class _TTLCache:
+    """Simple TTL cache for DB queries."""
+    def __init__(self, ttl: int = _CACHE_TTL):
+        self._data: dict[str, tuple[float, object]] = {}
+        self._ttl = ttl
+
+    def get(self, key: str):
+        entry = self._data.get(key)
+        if entry and _time.time() - entry[0] < self._ttl:
+            return entry[1]
+        return None
+
+    def set(self, key: str, value):
+        self._data[key] = (_time.time(), value)
+
+    def clear(self):
+        self._data.clear()
+
+
+_agent_cache = _TTLCache()
+_team_cache = _TTLCache()
+_channel_map_cache = _TTLCache(ttl=60)
+_webhook_cache: dict[str, discord.Webhook] = {}
 
 
 # ── DB helpers ───────────────────────────────────────────────
@@ -41,27 +73,46 @@ logger = logging.getLogger("flaude.discord")
 
 @sync_to_async
 def find_agent_by_name(name: str) -> Agent | None:
+    cached = _agent_cache.get(f"name:{name.lower()}")
+    if cached is not None:
+        return cached
     try:
-        return Agent.objects.get(status="active", name__iexact=name)
+        agent = Agent.objects.get(status="active", name__iexact=name)
+        _agent_cache.set(f"name:{name.lower()}", agent)
+        return agent
     except Agent.DoesNotExist:
+        _agent_cache.set(f"name:{name.lower()}", None)
         return None
 
 
 @sync_to_async
 def find_agent_for_channel(channel_id: str) -> Agent | None:
+    cached = _channel_map_cache.get(f"ch:{channel_id}")
+    if cached is not None:
+        return cached if cached != "_none_" else None
     for agent in Agent.objects.filter(status="active"):
         if str(channel_id) in [str(c) for c in (agent.channels or [])]:
+            _channel_map_cache.set(f"ch:{channel_id}", agent)
             return agent
+    _channel_map_cache.set(f"ch:{channel_id}", "_none_")
     return None
 
 
 @sync_to_async
 def get_active_agents():
-    return list(Agent.objects.filter(status="active"))
+    cached = _agent_cache.get("_all_")
+    if cached is not None:
+        return cached
+    agents = list(Agent.objects.filter(status="active"))
+    _agent_cache.set("_all_", agents)
+    return agents
 
 
 @sync_to_async
 def get_active_agent_count():
+    agents = _agent_cache.get("_all_")
+    if agents is not None:
+        return len(agents)
     return Agent.objects.filter(status="active").count()
 
 
@@ -72,15 +123,26 @@ def get_first_active_agent():
 
 @sync_to_async
 def find_team_by_name(name: str) -> AgentTeam | None:
+    cached = _team_cache.get(f"name:{name.lower()}")
+    if cached is not None:
+        return cached if cached != "_none_" else None
     try:
-        return AgentTeam.objects.get(name__iexact=name)
+        team = AgentTeam.objects.get(name__iexact=name)
+        _team_cache.set(f"name:{name.lower()}", team)
+        return team
     except AgentTeam.DoesNotExist:
+        _team_cache.set(f"name:{name.lower()}", "_none_")
         return None
 
 
 @sync_to_async
 def get_all_teams():
-    return list(AgentTeam.objects.all())
+    cached = _team_cache.get("_all_")
+    if cached is not None:
+        return cached
+    teams = list(AgentTeam.objects.all())
+    _team_cache.set("_all_", teams)
+    return teams
 
 
 @sync_to_async
@@ -171,13 +233,15 @@ class _LRUCache(OrderedDict):
 
 _thread_agents = _LRUCache(_MAX_CACHE)
 _thread_locks = _LRUCache(_MAX_CACHE)
+_thread_sessions = _LRUCache(_MAX_CACHE)  # thread_id → sdk_session_id
 
 
 @sync_to_async
-def _save_thread_msg(platform: str, thread_id: str, agent_name: str, role: str, content: str):
+def _save_thread_msg(platform: str, thread_id: str, agent_name: str, role: str, content: str, sdk_session_id: str = ""):
     ThreadMessage.objects.create(
         platform=platform, thread_id=thread_id,
         agent_name=agent_name, role=role, content=content[:2000],
+        sdk_session_id=sdk_session_id,
     )
     # Efficient cleanup: keep only latest 20 messages per thread
     keep_ids = list(
@@ -199,28 +263,12 @@ def _get_thread_agent_db(platform: str, thread_id: str) -> str | None:
 
 
 @sync_to_async
-def _get_thread_history(platform: str, thread_id: str) -> list[dict]:
-    """Load conversation history from DB for a thread."""
-    msgs = list(
-        ThreadMessage.objects.filter(platform=platform, thread_id=thread_id)
-        .order_by("created_at").values("role", "agent_name", "content")[:20]
-    )
-    return [{"role": m["role"], "agent": m["agent_name"], "content": m["content"]} for m in msgs]
-
-
-def _build_thread_prompt(history: list[dict], new_message: str, channel_context: str = "") -> str:
-    """Build a prompt that includes conversation history."""
-    parts = []
-    if channel_context:
-        parts.append(channel_context)
-    if history:
-        parts.append("[이전 대화 내역]")
-        for msg in history:
-            prefix = "사용자" if msg["role"] == "user" else msg["agent"]
-            parts.append(f"{prefix}: {msg['content']}")
-        parts.append("")
-    parts.append(f"사용자: {new_message}")
-    return "\n".join(parts)
+def _get_thread_session_db(platform: str, thread_id: str) -> str | None:
+    """Get the latest SDK session_id for a thread from DB."""
+    last = ThreadMessage.objects.filter(
+        platform=platform, thread_id=thread_id, role="agent",
+    ).exclude(sdk_session_id="").order_by("-created_at").values_list("sdk_session_id", flat=True).first()
+    return last
 
 
 async def _fetch_channel_context(channel, limit: int = 15) -> str:
@@ -238,6 +286,17 @@ async def _fetch_channel_context(channel, limit: int = 15) -> str:
     except Exception as e:
         logger.warning("Failed to fetch channel context: %s", e)
         return ""
+
+
+def _attachment_context(message: discord.Message) -> str:
+    """Build a context string from Discord message attachments (files, images)."""
+    if not message.attachments:
+        return ""
+    lines = []
+    for att in message.attachments:
+        size_kb = (att.size or 0) // 1024
+        lines.append(f"- {att.filename} ({att.content_type or 'unknown'}, {size_kb}KB): {att.url}")
+    return "\n\n[첨부 파일]\n" + "\n".join(lines) + "\n위 URL에서 파일 내용을 확인할 수 있습니다.\n"
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -259,13 +318,23 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
     return chunks
 
 
-async def get_or_create_webhook(channel) -> discord.Webhook:
+async def get_or_create_webhook(channel) -> discord.Webhook | None:
     target = channel.parent if isinstance(channel, discord.Thread) else channel
-    webhooks = await target.webhooks()
-    for wh in webhooks:
-        if wh.name == "Flaude":
-            return wh
-    return await target.create_webhook(name="Flaude")
+    cache_key = str(target.id)
+    if cache_key in _webhook_cache:
+        return _webhook_cache[cache_key]
+    try:
+        webhooks = await target.webhooks()
+        for wh in webhooks:
+            if wh.name == "Flaude":
+                _webhook_cache[cache_key] = wh
+                return wh
+        wh = await target.create_webhook(name="Flaude")
+        _webhook_cache[cache_key] = wh
+        return wh
+    except discord.Forbidden:
+        logger.warning("Missing Manage Webhooks permission on %s", cache_key)
+        return None
 
 
 _AVATAR_BG = ["F9C4AC", "B8E0D2", "D4C5F9", "F9E2AE", "A8D8EA", "F5B7B1", "C3E8BD", "E8D5B7"]
@@ -278,30 +347,84 @@ def _avatar_url(agent_name: str) -> str:
     return f"https://api.dicebear.com/9.x/notionists/png?seed={seed}&backgroundColor={bg}&backgroundType=solid&size=128"
 
 
-async def _send_agent_result(webhook, agent_name, result, thread=discord.utils.MISSING):
-    """Send agent result via webhook."""
-    for chunk in split_message(result):
-        await webhook.send(
-            content=chunk,
+async def _send_agent_result(webhook, agent_name, result, thread=discord.utils.MISSING, fallback_channel=None):
+    """Send agent result. Auto-creates thread for long responses."""
+    chunks = split_message(result)
+    is_long = len(chunks) > 1
+
+    if webhook:
+        first_msg = await webhook.send(
+            content=chunks[0],
             username=agent_name,
             avatar_url=_avatar_url(agent_name),
             thread=thread,
+            wait=True if is_long else False,
         )
+        if is_long and thread is discord.utils.MISSING and first_msg:
+            # Auto-create thread for long responses
+            auto_thread = await first_msg.create_thread(name=f"{agent_name} 응답")
+            for chunk in chunks[1:]:
+                await webhook.send(
+                    content=chunk,
+                    username=agent_name,
+                    avatar_url=_avatar_url(agent_name),
+                    thread=auto_thread,
+                )
+        else:
+            for chunk in chunks[1:]:
+                await webhook.send(
+                    content=chunk,
+                    username=agent_name,
+                    avatar_url=_avatar_url(agent_name),
+                    thread=thread,
+                )
+    elif fallback_channel:
+        first_msg = await fallback_channel.send(f"**{agent_name}**: {chunks[0]}")
+        if is_long:
+            auto_thread = await first_msg.create_thread(name=f"{agent_name} 응답")
+            for chunk in chunks[1:]:
+                await auto_thread.send(f"**{agent_name}**: {chunk}")
 
 
-async def _send_agent_result_and_get(webhook, agent_name, result, thread=discord.utils.MISSING):
-    """Send agent result via webhook and return the first sent message (for thread ID tracking)."""
+async def _send_agent_result_and_get(webhook, agent_name, result, thread=discord.utils.MISSING, fallback_channel=None):
+    """Send agent result and return first message. Auto-creates thread for long responses."""
+    chunks = split_message(result)
+    is_long = len(chunks) > 1
     first_msg = None
-    for chunk in split_message(result):
-        msg = await webhook.send(
-            content=chunk,
+
+    if webhook:
+        first_msg = await webhook.send(
+            content=chunks[0],
             username=agent_name,
             avatar_url=_avatar_url(agent_name),
             thread=thread,
             wait=True,
         )
-        if first_msg is None:
-            first_msg = msg
+        if is_long and thread is discord.utils.MISSING and first_msg:
+            auto_thread = await first_msg.create_thread(name=f"{agent_name} 응답")
+            for chunk in chunks[1:]:
+                await webhook.send(
+                    content=chunk,
+                    username=agent_name,
+                    avatar_url=_avatar_url(agent_name),
+                    thread=auto_thread,
+                )
+        else:
+            for chunk in chunks[1:]:
+                await webhook.send(
+                    content=chunk,
+                    username=agent_name,
+                    avatar_url=_avatar_url(agent_name),
+                    thread=thread,
+                    wait=True,
+                )
+    elif fallback_channel:
+        first_msg = await fallback_channel.send(f"**{agent_name}**: {chunks[0]}")
+        if is_long:
+            auto_thread = await first_msg.create_thread(name=f"{agent_name} 응답")
+            for chunk in chunks[1:]:
+                await auto_thread.send(f"**{agent_name}**: {chunk}")
+
     return first_msg
 
 
@@ -475,9 +598,17 @@ class FlaudeBot(discord.Client):
                     f"✅ 승인 완료! **{approval.next_agent.name}** 실행을 시작합니다..."
                 )
 
-                team_result = await resume_after_approval(approval)
-                webhook = await get_or_create_webhook(interaction.channel)
-                await _post_team_result(webhook, team_result)
+                # Resolve user for dispatch
+                flaude_user_id = await resolve_discord_user(str(interaction.user.id))
+                if flaude_user_id:
+                    team_result = await resume_after_approval(approval, flaude_user_id)
+                    webhook = await get_or_create_webhook(interaction.channel)
+                    await _post_team_result(webhook, team_result)
+                else:
+                    await interaction.followup.send(
+                        "Flaude 계정이 연결되어 있지 않습니다. `/link` 명령어로 연결해주세요.",
+                        ephemeral=True,
+                    )
 
             except ApprovalRequest.DoesNotExist:
                 await interaction.followup.send("해당 승인 요청을 찾을 수 없습니다.", ephemeral=True)
@@ -593,51 +724,102 @@ class FlaudeBot(discord.Client):
         if message.author == self.user or message.author.bot:
             return
 
-        # ── 스레드 내 후속 질문 ──
+        # ── 스레드 내 후속 질문 (SDK session resume) ──
         if isinstance(message.channel, discord.Thread):
             thread_id = str(message.channel.id)
-            agent_name = _thread_agents.get_val(thread_id)
+            content = message.content.strip()
 
-            # Try to identify agent from thread starter message
-            if not agent_name:
-                try:
-                    starter = await message.channel.fetch_message(message.channel.id)
-                    if starter.author.bot:
-                        found = await find_agent_by_name(starter.author.display_name)
-                        if found:
-                            agent_name = found.name
-                            _thread_agents.set_val(thread_id, agent_name)
-                except Exception:
-                    pass
+            # Check if message mentions a different agent via @name
+            mentioned_agent = None
+            user_message = content
+            if content.startswith("@"):
+                parts = content[1:].split(None, 1)
+                if len(parts) >= 1:
+                    mentioned = await find_agent_by_name(parts[0])
+                    if mentioned:
+                        mentioned_agent = mentioned
+                        user_message = parts[1] if len(parts) >= 2 else ""
 
-            # Fallback: check DB
-            if not agent_name:
-                agent_name = await _get_thread_agent_db("discord", thread_id)
-                if agent_name:
-                    _thread_agents.set_val(thread_id, agent_name)
+            if mentioned_agent:
+                # Switch to the mentioned agent within this thread
+                agent = mentioned_agent
+                agent_name = agent.name
+                _thread_agents.set_val(thread_id, agent_name)
+            else:
+                # Use the thread's original agent
+                agent_name = _thread_agents.get_val(thread_id)
 
-            if agent_name:
-                agent = await find_agent_by_name(agent_name)
-                if agent:
-                    lock = _thread_locks.get_val(thread_id)
-                    if lock is None:
-                        lock = asyncio.Lock()
-                        _thread_locks.set_val(thread_id, lock)
-                    if lock.locked():
-                        await message.reply("이전 요청을 처리 중입니다. 잠시 기다려주세요.")
-                        return
-                    async with lock:
-                        history = await _get_thread_history("discord", thread_id)
-                        # Only fetch channel context for first message in thread
-                        channel_ctx = await _fetch_channel_context(message.channel.parent) if not history else ""
-                        prompt = _build_thread_prompt(history, message.content, channel_ctx)
-                        await _save_thread_msg("discord", thread_id, agent.name, "user", message.content)
-                        async with message.channel.typing():
-                            result = await run_claude(agent, prompt, platform="discord")
-                        await _save_thread_msg("discord", thread_id, agent.name, "agent", result)
-                    webhook = await get_or_create_webhook(message.channel.parent)
-                    await _send_agent_result(webhook, agent.name, result, thread=message.channel)
+                # Try to identify agent from thread starter message
+                if not agent_name:
+                    try:
+                        starter = await message.channel.fetch_message(message.channel.id)
+                        if starter.author.bot:
+                            found = await find_agent_by_name(starter.author.display_name)
+                            if found:
+                                agent_name = found.name
+                                _thread_agents.set_val(thread_id, agent_name)
+                    except Exception:
+                        pass
+
+                # Fallback: check DB
+                if not agent_name:
+                    agent_name = await _get_thread_agent_db("discord", thread_id)
+                    if agent_name:
+                        _thread_agents.set_val(thread_id, agent_name)
+
+                agent = await find_agent_by_name(agent_name) if agent_name else None
+
+            if agent:
+                lock = _thread_locks.get_val(thread_id)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    _thread_locks.set_val(thread_id, lock)
+                if lock.locked():
+                    await message.reply("이전 요청을 처리 중입니다. 잠시 기다려주세요.")
                     return
+                async with lock:
+                    flaude_user_id = await resolve_discord_user(str(message.author.id))
+                    if not flaude_user_id:
+                        await message.reply(
+                            "Flaude 계정이 연결되어 있지 않습니다. "
+                            "Flaude 앱에서 `/link` 명령어로 연결해주세요."
+                        )
+                        return
+
+                    # If switching agent, start fresh session for new agent
+                    if mentioned_agent:
+                        sdk_session = None
+                    else:
+                        sdk_session = _thread_sessions.get_val(thread_id)
+                        if not sdk_session:
+                            sdk_session = await _get_thread_session_db("discord", thread_id)
+
+                    prompt_text = user_message if user_message else message.content
+                    prompt_text += _attachment_context(message)
+
+                    if sdk_session:
+                        result, new_session = await execute_agent(
+                            agent, prompt_text, flaude_user_id,
+                            session_id=sdk_session, resume=True,
+                            platform="discord",
+                        )
+                    else:
+                        channel_ctx = await _fetch_channel_context(message.channel.parent)
+                        prompt = f"{channel_ctx}사용자: {prompt_text}" if channel_ctx else prompt_text
+                        result, new_session = await execute_agent(
+                            agent, prompt, flaude_user_id,
+                            platform="discord",
+                        )
+
+                    if new_session:
+                        _thread_sessions.set_val(thread_id, new_session)
+
+                    await _save_thread_msg("discord", thread_id, agent.name, "user", message.content)
+                    await _save_thread_msg("discord", thread_id, agent.name, "agent", result, sdk_session_id=new_session or "")
+
+                webhook = await get_or_create_webhook(message.channel.parent)
+                await _send_agent_result(webhook, agent.name, result, thread=message.channel, fallback_channel=message.channel)
+                return
 
         # ── @agent_name message 패턴 ──
         content = message.content.strip()
@@ -652,52 +834,87 @@ class FlaudeBot(discord.Client):
                 # 팀인지 확인
                 team = await find_team_by_name(target_name)
                 if team:
-                    agents_with_meta = await get_team_agents_with_meta(team)
-                    if agents_with_meta:
-                        async with message.channel.typing():
-                            team_result = await run_team(team, agents_with_meta, user_message, platform="discord")
-                        await _post_team_result(webhook, team_result, thread)
+                    flaude_user_id = await resolve_discord_user(str(message.author.id))
+                    if not flaude_user_id:
+                        await message.reply(
+                            "Flaude 계정이 연결되어 있지 않습니다. "
+                            "Flaude 앱에서 `/link` 명령어로 연결해주세요."
+                        )
                         return
+
+                    from agents.orchestrator import get_team_agents_with_meta, run_team
+                    agents_with_meta = await get_team_agents_with_meta(team)
+                    async with message.channel.typing():
+                        team_result = await run_team(
+                            team, agents_with_meta, user_message,
+                            user_id=flaude_user_id, platform="discord",
+                        )
+                    if webhook:
+                        await _post_team_result(webhook, team_result, thread)
+                    else:
+                        # Fallback: post synthesis or last result
+                        final = team_result.synthesis or (team_result.results[-1] if team_result.results else None)
+                        if final:
+                            await message.channel.send(f"**{final.agent_name}**: {final.result}")
+                    return
 
                 # 에이전트인지 확인
                 agent = await find_agent_by_name(target_name)
                 if agent:
-                    # dispatch to user's Mac if linked
                     flaude_user_id = await resolve_discord_user(str(message.author.id))
-                    result = None
-                    if flaude_user_id:
-                        from agents.dispatch import dispatch_task
-                        result = await dispatch_task(str(flaude_user_id), agent.name, user_message)
+                    if not flaude_user_id:
+                        await message.reply(
+                            "Flaude 계정이 연결되어 있지 않습니다. "
+                            "Flaude 앱에서 `/link` 명령어로 연결해주세요."
+                        )
+                        return
 
-                    if not result:
-                        context = await _fetch_channel_context(message.channel)
-                        prompt = context + user_message if context else user_message
-                        async with message.channel.typing():
-                            result = await run_claude(agent, prompt, platform="discord")
+                    channel_ctx = await _fetch_channel_context(message.channel)
+                    full_msg = user_message + _attachment_context(message)
+                    prompt = f"{channel_ctx}사용자: {full_msg}" if channel_ctx else full_msg
+                    async with message.channel.typing():
+                        result, sdk_session = await execute_agent(
+                            agent, prompt, flaude_user_id,
+                            platform="discord",
+                        )
 
-                    # Send result first, then save with correct thread ID
-                    sent = await _send_agent_result_and_get(webhook, agent.name, result, thread)
-                    # Use the sent message ID as thread_id — Discord threads are created from this ID
+                    sent = await _send_agent_result_and_get(webhook, agent.name, result, thread, fallback_channel=message.channel)
                     thread_id = str(sent.id) if sent else str(message.id)
                     _thread_agents.set_val(thread_id, agent.name)
+                    if sdk_session:
+                        _thread_sessions.set_val(thread_id, sdk_session)
                     await _save_thread_msg("discord", thread_id, agent.name, "user", user_message)
-                    await _save_thread_msg("discord", thread_id, agent.name, "agent", result)
+                    await _save_thread_msg("discord", thread_id, agent.name, "agent", result, sdk_session_id=sdk_session or "")
                     return
 
         # ── Channel-based routing ──
         agent = await find_agent_for_channel(str(message.channel.id))
         if agent:
-            context = await _fetch_channel_context(message.channel)
-            prompt = context + message.content if context else message.content
+            flaude_user_id = await resolve_discord_user(str(message.author.id))
+            if not flaude_user_id:
+                await message.reply(
+                    "Flaude 계정이 연결되어 있지 않습니다. "
+                    "Flaude 앱에서 `/link` 명령어로 연결해주세요."
+                )
+                return
+
+            channel_ctx = await _fetch_channel_context(message.channel)
+            full_msg = message.content + _attachment_context(message)
+            prompt = f"{channel_ctx}사용자: {full_msg}" if channel_ctx else full_msg
             async with message.channel.typing():
-                result = await run_claude(agent, prompt, platform="discord")
+                result, sdk_session = await execute_agent(
+                    agent, prompt, flaude_user_id,
+                    platform="discord",
+                )
+
             webhook = await get_or_create_webhook(message.channel)
-            sent = await _send_agent_result_and_get(webhook, agent.name, result)
-            # Use sent message ID so thread creation maps correctly
+            sent = await _send_agent_result_and_get(webhook, agent.name, result, fallback_channel=message.channel)
             reply_id = str(sent.id) if sent else str(message.id)
             _thread_agents.set_val(reply_id, agent.name)
+            if sdk_session:
+                _thread_sessions.set_val(reply_id, sdk_session)
             await _save_thread_msg("discord", reply_id, agent.name, "user", message.content)
-            await _save_thread_msg("discord", reply_id, agent.name, "agent", result)
+            await _save_thread_msg("discord", reply_id, agent.name, "agent", result, sdk_session_id=sdk_session or "")
 
 
 def _format_parsed(parsed: dict) -> str:
