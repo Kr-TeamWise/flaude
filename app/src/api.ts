@@ -1,4 +1,4 @@
-export const SERVER_URL = import.meta.env.VITE_SERVER_URL || "https://flaude.com";
+export const SERVER_URL = import.meta.env.VITE_SERVER_URL || "https://flaude.team";
 
 function getApiBase(): string {
   return `${SERVER_URL}/api`;
@@ -506,3 +506,113 @@ export const decideApproval = (approvalId: number, decision: "approved" | "rejec
     method: "POST",
     body: JSON.stringify({ decision }),
   });
+
+// ── Meetings ────────────────────────────────────────
+
+export type Meeting = {
+  id: number;
+  title: string;
+  meeting_date: string;
+  duration_seconds: number | null;
+  participants: string[];
+  client_id: number | null;
+  audio_filename: string;
+  whisper_model: string;
+  audio_source: "system" | "mic" | "upload" | "import";
+  status: "recording" | "uploaded" | "transcribing" | "completed" | "failed";
+  error_message: string;
+  notes: string;
+  created_at: string;
+};
+
+export type MeetingInput = {
+  title: string;
+  meeting_date: string;
+  duration_seconds?: number;
+  participants?: string[];
+  client_id?: number;
+  error_message?: string;
+  audio_filename?: string;
+  whisper_model?: string;
+  audio_source?: string;
+  status?: string;
+  notes?: string;
+};
+
+export type MeetingTranscript = {
+  id: number;
+  full_text: string;
+  segments: { start: number; end: number; text: string }[];
+  language: string;
+};
+
+export type MeetingAgentResult = {
+  id: number;
+  agent_id: number;
+  agent_name: string;
+  processing_type: string;
+  custom_prompt: string;
+  result: string;
+  status: string;
+  execution_log_id: number | null;
+  created_at: string;
+};
+
+export type MeetingProcessResponse = {
+  result: MeetingAgentResult;
+  prompt: string;
+};
+
+export const getMeetings = (wsId: number) =>
+  request<Meeting[]>(`/workspaces/${wsId}/meetings`);
+
+export const createMeeting = (wsId: number, data: MeetingInput) =>
+  request<Meeting>(`/workspaces/${wsId}/meetings`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const getMeeting = (meetingId: number) =>
+  request<Meeting>(`/meetings/${meetingId}`);
+
+export const updateMeeting = (meetingId: number, data: Partial<MeetingInput>) =>
+  request<Meeting>(`/meetings/${meetingId}`, {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+
+export const deleteMeeting = (meetingId: number) =>
+  request<{ success: boolean }>(`/meetings/${meetingId}`, { method: "DELETE" });
+
+export const getMeetingTranscript = (meetingId: number) =>
+  request<MeetingTranscript>(`/meetings/${meetingId}/transcript`);
+
+export const saveMeetingTranscript = (
+  meetingId: number,
+  data: { full_text: string; segments?: { start: number; end: number; text: string }[]; language?: string }
+) =>
+  request<MeetingTranscript>(`/meetings/${meetingId}/transcript`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const updateMeetingTranscript = (
+  meetingId: number,
+  data: { full_text?: string; segments?: { start: number; end: number; text: string }[] }
+) =>
+  request<MeetingTranscript>(`/meetings/${meetingId}/transcript`, {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+
+export const processMeeting = (
+  meetingId: number,
+  data: { agent_id: number; processing_type: string; custom_prompt?: string }
+) =>
+  request<MeetingProcessResponse>(`/meetings/${meetingId}/process`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const getMeetingResults = (meetingId: number) =>
+  request<MeetingAgentResult[]>(`/meetings/${meetingId}/results`);

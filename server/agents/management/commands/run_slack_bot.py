@@ -26,7 +26,7 @@ from asgiref.sync import sync_to_async
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
-from agents.models import Agent, AgentTeam, Client, UserPlatformLink, ThreadMessage
+from agents.models import Agent, AgentTeam, Client, Meeting, MeetingTranscript, UserPlatformLink, ThreadMessage
 from agents.orchestrator import (
     execute_agent, run_team, get_team_agents_with_meta,
     get_running_executions, get_execution_history,
@@ -458,6 +458,78 @@ def create_slack_app(token: str) -> AsyncApp:
             )
         await client.chat_postEphemeral(channel=command["channel_id"], user=command["user_id"], text="\n\n".join(lines))
 
+    # ── /meeting ─────────────────────────────────────────
+    @app.command("/meeting")
+    async def handle_meeting(ack, command, client):
+        await ack()
+        text = command.get("text", "").strip()
+        user_id = command["user_id"]
+        channel_id = command["channel_id"]
+
+        @sync_to_async
+        def get_user_meetings():
+            from agents.models import Workspace, WorkspaceMembership
+            link = UserPlatformLink.objects.filter(platform="slack", platform_user_id=user_id).select_related("user").first()
+            if not link:
+                return None, "Flaude 계정을 먼저 연결하세요. `/link <token>`"
+            membership = WorkspaceMembership.objects.filter(user=link.user).first()
+            if not membership:
+                return None, "워크스페이스가 없습니다."
+            meetings = list(Meeting.objects.filter(workspace=membership.workspace, status="completed").order_by("-meeting_date")[:5])
+            return meetings, None
+
+        @sync_to_async
+        def get_transcript(meeting_id):
+            try:
+                return MeetingTranscript.objects.get(meeting_id=meeting_id).full_text
+            except MeetingTranscript.DoesNotExist:
+                return None
+
+        meetings, error = await get_user_meetings()
+        if error:
+            await client.chat_postEphemeral(channel=channel_id, user=user_id, text=error)
+            return
+        if not meetings:
+            await client.chat_postEphemeral(channel=channel_id, user=user_id, text="아직 회의 기록이 없습니다.")
+            return
+
+        if text.startswith("summary"):
+            latest = meetings[0]
+            transcript = await get_transcript(latest.id)
+            if not transcript:
+                await client.chat_postEphemeral(channel=channel_id, user=user_id, text="전사본이 없습니다.")
+                return
+
+            target_agent = await sync_to_async(lambda: Agent.objects.filter(status="active").first())()
+            if not target_agent:
+                await client.chat_postEphemeral(channel=channel_id, user=user_id, text="활성 에이전트가 없습니다.")
+                return
+
+            await client.chat_postMessage(channel=channel_id, text=f"_{target_agent.name}이(가) 회의록을 요약하고 있습니다..._")
+
+            prompt = (
+                f"다음 회의 녹취록을 요약해주세요.\n"
+                f"주요 논의 사항, 결정 사항, 참석자별 발언 요점을 정리해주세요.\n"
+                f"참석자: {', '.join(latest.participants) if latest.participants else '미상'}\n\n"
+                f"녹취록:\n{transcript[:8000]}"
+            )
+
+            try:
+                result, _ = await execute_agent(target_agent, prompt, "slack", channel_id=channel_id)
+                await client.chat_postMessage(channel=channel_id, text=f"*{latest.title} 요약* (by {target_agent.name})\n\n{result[:3000]}")
+            except Exception as e:
+                await client.chat_postMessage(channel=channel_id, text=f"요약 실패: {e}")
+        else:
+            lines = []
+            for m in meetings:
+                date = m.meeting_date.strftime("%m/%d %H:%M")
+                dur = f" ({m.duration_seconds // 60}분)" if m.duration_seconds else ""
+                lines.append(f"*{m.title}* — {date}{dur}")
+            await client.chat_postEphemeral(
+                channel=channel_id, user=user_id,
+                text="*최근 회의*\n" + "\n".join(lines) + "\n\n`/meeting summary` — 최근 회의 요약"
+            )
+
     # ── /help ────────────────────────────────────────────
     @app.command("/help")
     async def handle_help(ack, command, client):
@@ -483,6 +555,8 @@ def create_slack_app(token: str) -> AsyncApp:
             "`/approvals` — 대기 중인 승인 목록\n"
             "`/approve <id>` — 워크플로우 승인\n"
             "`/reject <id>` — 워크플로우 거절\n"
+            "`/meeting` — 최근 회의록 목록\n"
+            "`/meeting summary` — 최근 회의 요약\n"
             "`/schedule` — 스케줄 목록\n"
             "`/link` — Flaude 계정 연결\n\n"
             f"*멤버*: {agent_names}\n"

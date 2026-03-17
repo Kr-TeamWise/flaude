@@ -1,5 +1,55 @@
 @import "tailwindcss";
 
+/* Notion-style select dropdowns */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239CA3AF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 28px !important;
+  border: 1px solid #E5E7EB;
+  border-radius: 6px;
+  font-size: 13px;
+  color: #374151;
+  background-color: #FAFAFA;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  cursor: pointer;
+}
+select:hover {
+  border-color: #D1D5DB;
+  background-color: #F5F5F5;
+}
+select:focus {
+  outline: none;
+  border-color: #D97706;
+  box-shadow: 0 0 0 1px rgba(217, 119, 6, 0.15);
+  background-color: #fff;
+}
+select option {
+  padding: 8px;
+}
+
+/* Consistent input styling — exclude chat input (bg-transparent) */
+input[type="text"]:not([class*="bg-transparent"]),
+input[type="email"],
+input[type="number"],
+textarea:not([class*="bg-transparent"]) {
+  border: 1px solid #E5E7EB;
+  border-radius: 6px;
+  background-color: #FAFAFA;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+input[type="text"]:not([class*="bg-transparent"]):focus,
+input[type="email"]:focus,
+input[type="number"]:focus,
+textarea:not([class*="bg-transparent"]):focus {
+  outline: none;
+  border-color: #D97706;
+  box-shadow: 0 0 0 1px rgba(217, 119, 6, 0.15);
+  background-color: #fff;
+}
+
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }

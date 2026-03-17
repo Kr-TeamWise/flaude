@@ -14,7 +14,8 @@ from typing import List, Optional
 
 from .models import (
     Agent, AgentMemory, AgentSchedule, AgentTeam, ApprovalRequest,
-    AuthToken, Client, ClientHistory, ExecutionLog, Staff, TeamMemory,
+    AuthToken, Client, ClientHistory, ExecutionLog, Meeting,
+    MeetingAgentResult, MeetingTranscript, Staff, TeamMemory,
     UserPlatformLink, Workspace, WorkspaceInvite, WorkspaceMembership,
     STATUS_PIPELINE,
 )
@@ -1149,6 +1150,271 @@ def decide_approval_api(request, approval_id: int, payload: ApprovalDecisionIn):
     approval.decided_at = timezone.now()
     approval.save(update_fields=["status", "decided_by", "decided_at"])
     return {"ok": True, "status": approval.status}
+
+
+# ── Meetings ──────────────────────────────────────────────────
+
+
+MEETING_PROMPTS = {
+    "summary": (
+        "다음 회의 녹취록을 요약해주세요.\n"
+        "주요 논의 사항, 결정 사항, 참석자별 발언 요점을 정리해주세요.\n"
+        "참석자: {participants}\n\n녹취록:\n{transcript}"
+    ),
+    "action_items": (
+        "다음 회의 녹취록에서 액션 아이템을 추출해주세요.\n"
+        "담당자, 할 일, 기한을 표 형식으로 정리해주세요.\n"
+        "참석자: {participants}\n\n녹취록:\n{transcript}"
+    ),
+    "follow_up_email": (
+        "다음 회의 내용을 바탕으로 참석자들에게 보낼 팔로업 이메일을 작성해주세요.\n"
+        "회의 요약, 결정사항, 다음 단계를 포함하세요.\n"
+        "참석자: {participants}\n\n녹취록:\n{transcript}"
+    ),
+    "proposal": (
+        "다음 회의에서 논의된 내용을 바탕으로 제안서 초안을 작성해주세요.\n"
+        "참석자: {participants}\n\n녹취록:\n{transcript}"
+    ),
+}
+
+
+class MeetingIn(Schema):
+    title: str
+    meeting_date: datetime
+    duration_seconds: Optional[int] = None
+    participants: list = []
+    client_id: Optional[int] = None
+    audio_filename: str = ""
+    whisper_model: str = "small"
+    audio_source: str = "upload"
+    status: str = "uploaded"
+    notes: str = ""
+
+
+class MeetingOut(Schema):
+    id: int
+    title: str
+    meeting_date: datetime
+    duration_seconds: Optional[int] = None
+    participants: list
+    client_id: Optional[int] = None
+    audio_filename: str
+    whisper_model: str
+    audio_source: str
+    status: str
+    error_message: str
+    notes: str
+    created_at: datetime
+
+
+class MeetingUpdateIn(Schema):
+    title: Optional[str] = None
+    meeting_date: Optional[datetime] = None
+    duration_seconds: Optional[int] = None
+    participants: Optional[list] = None
+    client_id: Optional[int] = None
+    status: Optional[str] = None
+    error_message: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class TranscriptIn(Schema):
+    full_text: str
+    segments: list = []
+    language: str = "ko"
+
+
+class TranscriptOut(Schema):
+    id: int
+    full_text: str
+    segments: list
+    language: str
+
+
+class TranscriptUpdateIn(Schema):
+    full_text: Optional[str] = None
+    segments: Optional[list] = None
+
+
+class MeetingProcessIn(Schema):
+    agent_id: int
+    processing_type: str
+    custom_prompt: str = ""
+
+
+class MeetingAgentResultOut(Schema):
+    id: int
+    agent_id: int
+    agent_name: str
+    processing_type: str
+    custom_prompt: str
+    result: str
+    status: str
+    execution_log_id: Optional[int] = None
+    created_at: datetime
+
+
+class MeetingProcessOut(Schema):
+    result: MeetingAgentResultOut
+    prompt: str
+
+
+@api.get("/workspaces/{ws_id}/meetings", response=List[MeetingOut])
+def list_meetings(request, ws_id: int):
+    ws = _get_workspace(ws_id, request.auth)
+    return list(ws.meetings.all())
+
+
+@api.post("/workspaces/{ws_id}/meetings", response=MeetingOut)
+def create_meeting(request, ws_id: int, payload: MeetingIn):
+    ws = _get_workspace(ws_id, request.auth)
+    meeting = Meeting.objects.create(
+        workspace=ws,
+        created_by=request.auth,
+        title=payload.title,
+        meeting_date=payload.meeting_date,
+        duration_seconds=payload.duration_seconds,
+        participants=payload.participants,
+        client_id=payload.client_id,
+        audio_filename=payload.audio_filename,
+        whisper_model=payload.whisper_model,
+        audio_source=payload.audio_source,
+        status=payload.status,
+        notes=payload.notes,
+    )
+    return meeting
+
+
+@api.get("/meetings/{meeting_id}", response=MeetingOut)
+def get_meeting(request, meeting_id: int):
+    meeting = get_object_or_404(Meeting, id=meeting_id)
+    _get_workspace(meeting.workspace_id, request.auth)
+    return meeting
+
+
+@api.put("/meetings/{meeting_id}", response=MeetingOut)
+def update_meeting(request, meeting_id: int, payload: MeetingUpdateIn):
+    meeting = get_object_or_404(Meeting, id=meeting_id)
+    _get_workspace(meeting.workspace_id, request.auth)
+    for attr, value in payload.dict(exclude_unset=True).items():
+        setattr(meeting, attr, value)
+    meeting.save()
+    return meeting
+
+
+@api.delete("/meetings/{meeting_id}", response={204: None})
+def delete_meeting(request, meeting_id: int):
+    meeting = get_object_or_404(Meeting, id=meeting_id)
+    _get_workspace(meeting.workspace_id, request.auth)
+    meeting.delete()
+    return 204, None
+
+
+@api.post("/meetings/{meeting_id}/transcript", response=TranscriptOut)
+def save_transcript(request, meeting_id: int, payload: TranscriptIn):
+    meeting = get_object_or_404(Meeting, id=meeting_id)
+    _get_workspace(meeting.workspace_id, request.auth)
+    transcript, created = MeetingTranscript.objects.update_or_create(
+        meeting=meeting,
+        defaults={
+            "full_text": payload.full_text,
+            "segments": payload.segments,
+            "language": payload.language,
+        },
+    )
+    if meeting.status in ("uploaded", "transcribing"):
+        meeting.status = "completed"
+        meeting.save(update_fields=["status"])
+    return transcript
+
+
+@api.get("/meetings/{meeting_id}/transcript", response=TranscriptOut)
+def get_transcript(request, meeting_id: int):
+    meeting = get_object_or_404(Meeting, id=meeting_id)
+    _get_workspace(meeting.workspace_id, request.auth)
+    transcript = get_object_or_404(MeetingTranscript, meeting=meeting)
+    return transcript
+
+
+@api.put("/meetings/{meeting_id}/transcript", response=TranscriptOut)
+def update_transcript(request, meeting_id: int, payload: TranscriptUpdateIn):
+    meeting = get_object_or_404(Meeting, id=meeting_id)
+    _get_workspace(meeting.workspace_id, request.auth)
+    transcript = get_object_or_404(MeetingTranscript, meeting=meeting)
+    for attr, value in payload.dict(exclude_unset=True).items():
+        setattr(transcript, attr, value)
+    transcript.save()
+    return transcript
+
+
+@api.post("/meetings/{meeting_id}/process", response=MeetingProcessOut)
+def process_meeting(request, meeting_id: int, payload: MeetingProcessIn):
+    meeting = get_object_or_404(Meeting, id=meeting_id)
+    _get_workspace(meeting.workspace_id, request.auth)
+    agent = get_object_or_404(Agent, id=payload.agent_id)
+
+    # Build prompt
+    transcript = get_object_or_404(MeetingTranscript, meeting=meeting)
+    participants_str = ", ".join(meeting.participants) if meeting.participants else "미상"
+
+    if payload.processing_type == "custom":
+        prompt = payload.custom_prompt
+    else:
+        template = MEETING_PROMPTS.get(payload.processing_type, MEETING_PROMPTS["summary"])
+        prompt = template.format(participants=participants_str, transcript=transcript.full_text)
+
+    # Create execution log
+    log = ExecutionLog.objects.create(
+        agent=agent,
+        prompt=prompt,
+        platform="app",
+    )
+
+    # Create result record
+    result = MeetingAgentResult.objects.create(
+        meeting=meeting,
+        agent=agent,
+        processing_type=payload.processing_type,
+        custom_prompt=payload.custom_prompt,
+        execution_log=log,
+        status="pending",
+    )
+
+    return {
+        "result": {
+            "id": result.id,
+            "agent_id": agent.id,
+            "agent_name": agent.name,
+            "processing_type": result.processing_type,
+            "custom_prompt": result.custom_prompt,
+            "result": result.result,
+            "status": result.status,
+            "execution_log_id": log.id,
+            "created_at": result.created_at,
+        },
+        "prompt": prompt,
+    }
+
+
+@api.get("/meetings/{meeting_id}/results", response=List[MeetingAgentResultOut])
+def list_meeting_results(request, meeting_id: int):
+    meeting = get_object_or_404(Meeting, id=meeting_id)
+    _get_workspace(meeting.workspace_id, request.auth)
+    results = meeting.agent_results.select_related("agent").order_by("-created_at")
+    return [
+        {
+            "id": r.id,
+            "agent_id": r.agent.id,
+            "agent_name": r.agent.name,
+            "processing_type": r.processing_type,
+            "custom_prompt": r.custom_prompt,
+            "result": r.result,
+            "status": r.status,
+            "execution_log_id": r.execution_log_id,
+            "created_at": r.created_at,
+        }
+        for r in results
+    ]
 
 
 def _fallback_parse(raw_text: str) -> dict:
