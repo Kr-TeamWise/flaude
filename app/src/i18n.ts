@@ -106,7 +106,7 @@ const translations = {
   "wizard.skip": { ko: "건너뛰기", en: "Skip" },
   "wizard.done": { ko: "시작하기", en: "Get Started" },
   "wizard.claudeTitle": { ko: "Claude Code 확인", en: "Claude Code Check" },
-  "wizard.claudeDesc": { ko: "Claude Code CLI가 설치되어 있어야 합니다.\nClaude Code Max 구독이 필요합니다.", en: "Claude Code CLI must be installed.\nClaude Code Max subscription required." },
+  "wizard.claudeDesc": { ko: "Claude Code CLI가 설치되어 있어야 합니다.", en: "Claude Code CLI must be installed." },
   "wizard.claudeChecking": { ko: "확인 중...", en: "Checking..." },
   "wizard.claudeOk": { ko: "Claude Code 설치됨", en: "Claude Code installed" },
   "wizard.claudeNotFound": { ko: "Claude Code를 찾을 수 없습니다", en: "Claude Code not found" },

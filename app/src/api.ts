@@ -1,4 +1,4 @@
-export const SERVER_URL = import.meta.env.VITE_SERVER_URL || "https://flaude.team";
+export const SERVER_URL = import.meta.env.VITE_SERVER_URL || "https://app.flaude.team";
 
 function getApiBase(): string {
   return `${SERVER_URL}/api`;

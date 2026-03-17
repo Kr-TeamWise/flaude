@@ -883,7 +883,7 @@ async fn setup_all_integrations() -> Result<String, String> {
 
 #[tauri::command]
 async fn check_claude_installed() -> Result<bool, String> {
-    match shell("which claude 2>/dev/null") {
+    match shell("which claude 2>/dev/null || ls /usr/local/bin/claude 2>/dev/null || ls /Applications/cmux.app/Contents/Resources/bin/claude 2>/dev/null || ls \"$HOME/.claude/local/claude\" 2>/dev/null") {
         Ok(path) => Ok(!path.is_empty()),
         Err(_) => Ok(false),
     }
