@@ -25,7 +25,7 @@ from discord import app_commands
 from django.core.management.base import BaseCommand
 from asgiref.sync import sync_to_async
 
-from agents.models import Agent, AgentTeam, Client, UserPlatformLink, ThreadMessage
+from agents.models import Agent, AgentTeam, Client, Meeting, MeetingTranscript, UserPlatformLink, ThreadMessage
 from agents.orchestrator import (
     execute_agent, build_context_prompt,
     get_running_executions, get_execution_history,
@@ -673,6 +673,108 @@ class FlaudeBot(discord.Client):
             await interaction.response.send_message("\n\n".join(lines), ephemeral=True)
 
         # ── /help ────────────────────────────────────────
+        # ── /meeting ────────────────────────────────────
+        @self.tree.command(name="meeting", description="최근 회의록 보기 / 요약 요청")
+        @app_commands.describe(
+            action="list: 목록 보기, summary: 최근 회의 요약 (기본: list)",
+            agent="요약할 에이전트 이름 (선택)",
+        )
+        async def meeting_command(
+            interaction: discord.Interaction,
+            action: str = "list",
+            agent: str | None = None,
+        ):
+            @sync_to_async
+            def get_recent_meetings():
+                from agents.models import Workspace, WorkspaceMembership
+                # Find user's workspace
+                link = UserPlatformLink.objects.filter(
+                    platform="discord", platform_user_id=str(interaction.user.id)
+                ).select_related("user").first()
+                if not link:
+                    return None, "Flaude 계정을 먼저 연결하세요. `/link <token>`"
+                membership = WorkspaceMembership.objects.filter(user=link.user).first()
+                if not membership:
+                    return None, "워크스페이스가 없습니다."
+                meetings = list(
+                    Meeting.objects.filter(workspace=membership.workspace, status="completed")
+                    .order_by("-meeting_date")[:5]
+                )
+                return meetings, None
+
+            @sync_to_async
+            def get_transcript(meeting_id):
+                try:
+                    return MeetingTranscript.objects.get(meeting_id=meeting_id).full_text
+                except MeetingTranscript.DoesNotExist:
+                    return None
+
+            meetings, error = await get_recent_meetings()
+            if error:
+                await interaction.response.send_message(error, ephemeral=True)
+                return
+            if not meetings:
+                await interaction.response.send_message("아직 회의 기록이 없습니다.", ephemeral=True)
+                return
+
+            if action == "list":
+                lines = []
+                for m in meetings:
+                    date = m.meeting_date.strftime("%m/%d %H:%M")
+                    dur = f" ({m.duration_seconds // 60}분)" if m.duration_seconds else ""
+                    lines.append(f"**{m.title}** — {date}{dur}")
+                await interaction.response.send_message(
+                    "**최근 회의**\n" + "\n".join(lines), ephemeral=True
+                )
+            elif action == "summary":
+                latest = meetings[0]
+                transcript = await get_transcript(latest.id)
+                if not transcript:
+                    await interaction.response.send_message("전사본이 없습니다.", ephemeral=True)
+                    return
+
+                # Find agent
+                target_agent = None
+                if agent:
+                    target_agent = await sync_to_async(
+                        lambda: Agent.objects.filter(name__iexact=agent, status="active").first()
+                    )()
+                if not target_agent:
+                    target_agent = await sync_to_async(
+                        lambda: Agent.objects.filter(status="active").first()
+                    )()
+                if not target_agent:
+                    await interaction.response.send_message("활성 에이전트가 없습니다.", ephemeral=True)
+                    return
+
+                await interaction.response.defer()
+
+                prompt = (
+                    f"다음 회의 녹취록을 요약해주세요.\n"
+                    f"주요 논의 사항, 결정 사항, 참석자별 발언 요점을 정리해주세요.\n"
+                    f"참석자: {', '.join(latest.participants) if latest.participants else '미상'}\n\n"
+                    f"녹취록:\n{transcript[:8000]}"
+                )
+
+                try:
+                    result, _ = await execute_agent(
+                        target_agent, prompt, "discord",
+                        channel_id=str(interaction.channel_id),
+                    )
+                    # Split if needed
+                    if len(result) > 2000:
+                        await interaction.followup.send(f"**{latest.title} 요약** (by {target_agent.name})")
+                        for i in range(0, len(result), 2000):
+                            await interaction.followup.send(result[i:i+2000])
+                    else:
+                        await interaction.followup.send(f"**{latest.title} 요약** (by {target_agent.name})\n\n{result}")
+                except Exception as e:
+                    await interaction.followup.send(f"요약 실패: {e}")
+            else:
+                await interaction.response.send_message(
+                    "사용법: `/meeting` (목록) 또는 `/meeting summary` (최근 회의 요약)", ephemeral=True
+                )
+
         @self.tree.command(name="help", description="Flaude 사용법")
         async def help_command(interaction: discord.Interaction):
             agents = await get_active_agents()
@@ -697,6 +799,8 @@ class FlaudeBot(discord.Client):
                 "`/approvals` — 대기 중인 승인 목록\n"
                 "`/approve <id>` — 워크플로우 승인\n"
                 "`/reject <id>` — 워크플로우 거절\n"
+                "`/meeting` — 최근 회의록 목록\n"
+                "`/meeting summary` — 최근 회의 요약\n"
                 "`/schedule` — 스케줄 목록\n"
                 "`/link` — Flaude 계정 연결\n\n"
                 f"**멤버**: {agent_names}\n"

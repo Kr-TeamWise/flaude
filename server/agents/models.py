@@ -251,6 +251,67 @@ class UserPlatformLink(models.Model):
         unique_together = ("platform", "platform_user_id")
 
 
+class Meeting(models.Model):
+    workspace = models.ForeignKey(Workspace, on_delete=models.CASCADE, related_name="meetings")
+    title = models.CharField(max_length=200)
+    meeting_date = models.DateTimeField()
+    duration_seconds = models.IntegerField(null=True, blank=True)
+    participants = models.JSONField(default=list)
+    client = models.ForeignKey(Client, null=True, blank=True, on_delete=models.SET_NULL, related_name="meetings")
+    audio_filename = models.CharField(max_length=500, blank=True)
+    whisper_model = models.CharField(max_length=20, default="small")
+    audio_source = models.CharField(max_length=20, default="upload", choices=[
+        ("system", "System Audio"), ("mic", "Microphone"),
+        ("upload", "Upload"), ("import", "Import"),
+    ])
+    status = models.CharField(max_length=20, default="uploaded", choices=[
+        ("recording", "Recording"), ("uploaded", "Uploaded"),
+        ("transcribing", "Transcribing"), ("completed", "Completed"),
+        ("failed", "Failed"),
+    ])
+    error_message = models.TextField(blank=True)
+    notes = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-meeting_date"]
+
+    def __str__(self):
+        return f"{self.title} ({self.meeting_date})"
+
+
+class MeetingTranscript(models.Model):
+    meeting = models.OneToOneField(Meeting, on_delete=models.CASCADE, related_name="transcript")
+    full_text = models.TextField()
+    segments = models.JSONField(default=list)
+    language = models.CharField(max_length=10, default="ko")
+
+    def __str__(self):
+        return f"Transcript for {self.meeting.title}"
+
+
+class MeetingAgentResult(models.Model):
+    meeting = models.ForeignKey(Meeting, on_delete=models.CASCADE, related_name="agent_results")
+    agent = models.ForeignKey(Agent, on_delete=models.CASCADE, related_name="meeting_results")
+    processing_type = models.CharField(max_length=30, choices=[
+        ("summary", "Summary"), ("action_items", "Action Items"),
+        ("follow_up_email", "Follow-up Email"), ("proposal", "Proposal"),
+        ("custom", "Custom"),
+    ])
+    custom_prompt = models.TextField(blank=True)
+    result = models.TextField(blank=True)
+    execution_log = models.ForeignKey(ExecutionLog, null=True, blank=True, on_delete=models.SET_NULL)
+    status = models.CharField(max_length=20, default="pending", choices=[
+        ("pending", "Pending"), ("running", "Running"),
+        ("completed", "Completed"), ("failed", "Failed"),
+    ])
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.agent.name} - {self.processing_type} for {self.meeting.title}"
+
+
 class ThreadMessage(models.Model):
     """Persisted chat history for Discord/Slack threads."""
     platform = models.CharField(max_length=20)  # "discord" or "slack"

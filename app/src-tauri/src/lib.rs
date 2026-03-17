@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use once_cell::sync::Lazy;
 use tauri::Emitter;
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 /// PID of the currently running agent subprocess (for cancellation).
 static AGENT_PID: Lazy<Arc<Mutex<Option<u32>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
@@ -13,6 +14,11 @@ static AGENT_STDIN: Lazy<Arc<std::sync::Mutex<Option<ChildStdin>>>> = Lazy::new(
 
 /// WebSocket connection state
 static WS_CONNECTED: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
+
+/// Recording state
+static RECORDING_PID: Lazy<Arc<Mutex<Option<u32>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
+static RECORDING_START: Lazy<Arc<Mutex<Option<std::time::Instant>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
+static RECORDING_PATH: Lazy<Arc<Mutex<Option<String>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
 /// Allowlist of known integration IDs to prevent injection.
 const KNOWN_INTEGRATIONS: &[&str] = &[
@@ -626,7 +632,7 @@ async fn set_data_path(path: String) -> Result<(), String> {
 
 // ── WebSocket client ──────────────────────────────────
 
-/// Connect to flaude.com WebSocket hub and listen for tasks.
+/// Connect to flaude.team WebSocket hub and listen for tasks.
 /// When a task arrives, execute the agent and send result back.
 #[tauri::command]
 async fn ws_connect(server_url: String, token: String) -> Result<String, String> {
@@ -897,12 +903,658 @@ async fn install_claude() -> Result<String, String> {
     Ok("Claude Code installed successfully.".into())
 }
 
+// ── Meeting: Dependency checks ──────────────────────
+
+#[tauri::command]
+async fn check_whisper_installed() -> Result<bool, String> {
+    match shell("which whisper-cli 2>/dev/null || which whisper-cpp 2>/dev/null || which whisper 2>/dev/null") {
+        Ok(path) => Ok(!path.is_empty()),
+        Err(_) => Ok(false),
+    }
+}
+
+#[tauri::command]
+async fn check_ffmpeg_installed() -> Result<bool, String> {
+    match shell("which ffmpeg 2>/dev/null") {
+        Ok(path) => Ok(!path.is_empty()),
+        Err(_) => Ok(false),
+    }
+}
+
+#[tauri::command]
+async fn check_system_audio_supported() -> Result<bool, String> {
+    // ScreenCaptureKit on macOS 13+, WASAPI on Windows — always available
+    #[cfg(target_os = "macos")]
+    { Ok(true) }
+    #[cfg(target_os = "windows")]
+    { Ok(true) }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    { Ok(false) }
+}
+
+#[tauri::command]
+async fn install_whisper() -> Result<String, String> {
+    shell("brew install whisper-cpp")
+}
+
+#[tauri::command]
+async fn install_ffmpeg() -> Result<String, String> {
+    shell("brew install ffmpeg")
+}
+
+// BlackHole removed — using ScreenCaptureKit (macOS) / WASAPI (Windows) for system audio
+
+// ── Meeting: Whisper models ─────────────────────────
+
+fn whisper_model_dir() -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+    let dir = format!("{}/.flaude/whisper-models", home);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {}", e))?;
+    Ok(dir)
+}
+
+#[tauri::command]
+async fn list_whisper_models() -> Result<String, String> {
+    let known = vec![
+        ("base", 140),
+        ("small", 490),
+        ("medium", 1500),
+        ("large", 2900),
+    ];
+
+    let model_dir = whisper_model_dir()?;
+
+    let mut models = Vec::new();
+    for (name, size_mb) in &known {
+        let filename = format!("ggml-{}.bin", name);
+        let path = format!("{}/{}", model_dir, filename);
+        let downloaded = std::path::Path::new(&path).exists();
+        models.push(serde_json::json!({
+            "name": name,
+            "size_mb": size_mb,
+            "path": if downloaded { path } else { "".to_string() },
+            "downloaded": downloaded,
+        }));
+    }
+
+    serde_json::to_string(&models).map_err(|e| format!("JSON error: {}", e))
+}
+
+#[tauri::command]
+async fn download_whisper_model(name: String) -> Result<String, String> {
+    if !["base", "small", "medium", "large"].contains(&name.as_str()) {
+        return Err(format!("Unknown model: {}", name));
+    }
+    let model_dir = whisper_model_dir()?;
+    let dest = format!("{}/ggml-{}.bin", model_dir, name);
+    let url = format!(
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{}.bin",
+        name
+    );
+
+    // Use spawn_blocking + Command directly (shell() has 2min timeout, too short for large models)
+    let dest_c = dest.clone();
+    tokio::task::spawn_blocking(move || {
+        let curl_path = shell("which curl").unwrap_or_else(|_| "/usr/bin/curl".to_string());
+        let output = Command::new(&curl_path)
+            .args(&["-L", "-o", &dest_c, &url])
+            .output()
+            .map_err(|e| format!("curl failed: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(format!("Download failed: {}", stderr));
+        }
+
+        // Verify file exists and has reasonable size
+        let meta = std::fs::metadata(&dest_c).map_err(|e| format!("File check failed: {}", e))?;
+        if meta.len() < 1_000_000 {
+            let _ = std::fs::remove_file(&dest_c);
+            return Err("Download incomplete — file too small".to_string());
+        }
+
+        Ok(dest_c)
+    })
+    .await
+    .map_err(|e| format!("Task error: {}", e))?
+}
+
+#[tauri::command]
+async fn delete_whisper_model(name: String) -> Result<String, String> {
+    if !["base", "small", "medium", "large"].contains(&name.as_str()) {
+        return Err(format!("Unknown model: {}", name));
+    }
+    let model_dir = whisper_model_dir()?;
+    let path = format!("{}/ggml-{}.bin", model_dir, name);
+    if std::path::Path::new(&path).exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("Delete failed: {}", e))?;
+        Ok(format!("Deleted {}", path))
+    } else {
+        Err("Model file not found".to_string())
+    }
+}
+
+// ── Meeting: Transcription ──────────────────────────
+
+#[tauri::command]
+async fn transcribe_audio(path: String, model: String, language: String) -> Result<String, String> {
+    let path_c = path.clone();
+    let model_c = model.clone();
+    let lang_c = language.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // Resolve model path — fallback to any available model if requested one doesn't exist
+        let home = std::env::var("HOME").unwrap_or_default();
+        let model_dir = format!("{}/.flaude/whisper-models", home);
+        let mut model_path = if std::path::Path::new(&model_c).exists() {
+            model_c.clone()
+        } else {
+            format!("{}/ggml-{}.bin", model_dir, model_c)
+        };
+
+        if !std::path::Path::new(&model_path).exists() {
+            let fallbacks = ["medium", "small", "base", "large"];
+            model_path = String::new();
+            for fb in &fallbacks {
+                let p = format!("{}/ggml-{}.bin", model_dir, fb);
+                if std::path::Path::new(&p).exists() {
+                    model_path = p;
+                    break;
+                }
+            }
+            if model_path.is_empty() {
+                return Err("No whisper model found. Please download a model in Settings > Meeting.".to_string());
+            }
+        }
+
+        // Convert non-wav files to wav first (whisper-cli needs wav for reliable results)
+        let wav_path = if !path_c.ends_with(".wav") {
+            let converted = format!("{}.converted.wav", path_c);
+            if !std::path::Path::new(&converted).exists() {
+                let ffmpeg_path = shell("which ffmpeg").unwrap_or_else(|_| "/opt/homebrew/bin/ffmpeg".to_string());
+                let status = Command::new(&ffmpeg_path)
+                    .args(&["-i", &path_c, "-ar", "16000", "-ac", "1", "-y", &converted])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map_err(|e| format!("ffmpeg conversion failed: {}", e))?;
+                if !status.success() {
+                    return Err("Failed to convert audio file to WAV".to_string());
+                }
+            }
+            converted
+        } else {
+            path_c.clone()
+        };
+
+        let bin = if shell("which whisper-cli 2>/dev/null").is_ok() {
+            "whisper-cli"
+        } else {
+            "whisper-cpp"
+        };
+
+        // -oj writes JSON to file. Use -of to specify output path (no extension)
+        let json_out = format!("{}.whisper", wav_path);
+        let prompt_hint = if lang_c == "ko" { " --prompt '회의 녹취록입니다.'" } else { "" };
+        let script = format!(
+            "{} -m '{}' -l {} -bs 8 -bo 5{} -oj -of '{}' -f '{}'",
+            bin, model_path, lang_c, prompt_hint, json_out, wav_path
+        );
+        shell(&script)?;
+
+        let json_path = format!("{}.json", json_out);
+        std::fs::read_to_string(&json_path)
+            .map_err(|e| format!("Failed to read whisper output: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
+}
+
+// ── Meeting: Subtitle parsing ───────────────────────
+
+fn parse_timestamp_vtt(ts: &str) -> f64 {
+    let parts: Vec<&str> = ts.split(':').collect();
+    match parts.len() {
+        3 => {
+            let h: f64 = parts[0].parse().unwrap_or(0.0);
+            let m: f64 = parts[1].parse().unwrap_or(0.0);
+            let s: f64 = parts[2].replace(',', ".").parse().unwrap_or(0.0);
+            h * 3600.0 + m * 60.0 + s
+        }
+        2 => {
+            let m: f64 = parts[0].parse().unwrap_or(0.0);
+            let s: f64 = parts[1].replace(',', ".").parse().unwrap_or(0.0);
+            m * 60.0 + s
+        }
+        _ => 0.0,
+    }
+}
+
+#[tauri::command]
+async fn parse_subtitle(path: String) -> Result<String, String> {
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let mut segments: Vec<serde_json::Value> = Vec::new();
+    let mut full_text = String::new();
+
+    let is_vtt = path.ends_with(".vtt");
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    // Skip VTT header
+    if is_vtt {
+        while i < lines.len() && !lines[i].contains("-->") {
+            i += 1;
+        }
+    }
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        // Skip SRT sequence numbers
+        if !is_vtt && line.parse::<u32>().is_ok() {
+            i += 1;
+            continue;
+        }
+
+        if line.contains("-->") {
+            let parts: Vec<&str> = line.split("-->").collect();
+            if parts.len() == 2 {
+                let start = parse_timestamp_vtt(parts[0].trim());
+                let end = parse_timestamp_vtt(parts[1].trim().split_whitespace().next().unwrap_or(""));
+
+                // Collect text lines until empty line
+                let mut text_lines = Vec::new();
+                i += 1;
+                while i < lines.len() && !lines[i].trim().is_empty() {
+                    text_lines.push(lines[i].trim());
+                    i += 1;
+                }
+                let text = text_lines.join(" ");
+                if !text.is_empty() {
+                    if !full_text.is_empty() { full_text.push(' '); }
+                    full_text.push_str(&text);
+                    segments.push(serde_json::json!({
+                        "start": start,
+                        "end": end,
+                        "text": text,
+                    }));
+                }
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    let result = serde_json::json!({
+        "full_text": full_text,
+        "segments": segments,
+    });
+    serde_json::to_string(&result).map_err(|e| format!("JSON error: {}", e))
+}
+
+// ── Meeting: Recording ──────────────────────────────
+// Mic: ffmpeg (cross-platform)
+// System audio: ScreenCaptureKit (macOS) / WASAPI loopback (Windows)
+// No BlackHole or virtual audio device needed.
+
+/// Flag to signal system audio recording thread to stop.
+static SYSTEM_RECORDING: Lazy<Arc<std::sync::atomic::AtomicBool>> =
+    Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+/// Start recording from mic (ffmpeg) or system audio (native API).
+#[tauri::command]
+async fn start_recording(source: String, path: String) -> Result<String, String> {
+    // Create parent directory
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+
+    if source == "system" {
+        // System audio via ScreenCaptureKit (macOS) or WASAPI (Windows)
+        start_system_audio_recording(&path).await?;
+    } else {
+        // Microphone via ffmpeg
+        start_mic_recording(&path).await?;
+    }
+
+    // Store recording state
+    {
+        let mut guard = RECORDING_START.lock().await;
+        *guard = Some(std::time::Instant::now());
+    }
+    {
+        let mut guard = RECORDING_PATH.lock().await;
+        *guard = Some(path.clone());
+    }
+
+    let result = serde_json::json!({"path": path, "source": source});
+    serde_json::to_string(&result).map_err(|e| format!("JSON error: {}", e))
+}
+
+/// Start mic recording via ffmpeg.
+async fn start_mic_recording(path: &str) -> Result<(), String> {
+    let ffmpeg_path = shell("which ffmpeg")
+        .unwrap_or_else(|_| "/opt/homebrew/bin/ffmpeg".to_string());
+
+    #[cfg(target_os = "macos")]
+    let args = vec!["-f", "avfoundation", "-i", ":default", "-ar", "16000", "-ac", "1", "-y"];
+    #[cfg(target_os = "windows")]
+    let args = vec!["-f", "dshow", "-i", "audio=default", "-ar", "16000", "-ac", "1", "-y"];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let args = vec!["-f", "pulse", "-i", "default", "-ar", "16000", "-ac", "1", "-y"];
+
+    let mut full_args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    full_args.push(path.to_string());
+
+    let mut child = Command::new(&ffmpeg_path)
+        .args(&full_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start ffmpeg: {}", e))?;
+
+    let pid = child.id();
+
+    // Wait and check if ffmpeg is still alive
+    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            return Err(format!(
+                "Microphone access failed (code: {}). Grant microphone permission in System Settings > Privacy > Microphone.",
+                status
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => return Err(format!("Failed to check process: {}", e)),
+    }
+    std::mem::forget(child);
+
+    let mut guard = RECORDING_PID.lock().await;
+    *guard = Some(pid);
+    let _ = std::fs::write("/tmp/flaude_recording.pid", pid.to_string());
+    Ok(())
+}
+
+/// Start system audio recording via ScreenCaptureKit (macOS).
+#[cfg(target_os = "macos")]
+async fn start_system_audio_recording(path: &str) -> Result<(), String> {
+    use screencapturekit::prelude::*;
+    use std::sync::atomic::Ordering;
+
+    let path_owned = path.to_string();
+    SYSTEM_RECORDING.store(true, Ordering::SeqCst);
+
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let content = SCShareableContent::get()
+            .map_err(|e| format!("Failed to get shareable content (grant Screen Recording permission): {:?}", e))?;
+        let display = content.displays().into_iter().next()
+            .ok_or("No display found")?;
+
+        let filter = SCContentFilter::create()
+            .with_display(&display)
+            .with_excluding_windows(&[])
+            .build();
+
+        let config = SCStreamConfiguration::new()
+            .with_captures_audio(true)
+            .with_sample_rate(16000)
+            .with_channel_count(1)
+            .with_width(2)
+            .with_height(2); // Minimal video size (we only want audio)
+
+        // WAV writer
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            hound::WavWriter::create(&path_owned, spec)
+                .map_err(|e| format!("Failed to create WAV: {}", e))?
+        ));
+
+        let flag = SYSTEM_RECORDING.clone();
+        let writer_clone = writer.clone();
+
+        // Use closure-based handler
+        let mut stream = SCStream::new(&filter, &config);
+        let flag_c = flag.clone();
+        let writer_c = writer_clone.clone();
+        stream.add_output_handler(
+            move |sample: CMSampleBuffer, of_type: SCStreamOutputType| {
+                if !flag_c.load(Ordering::Relaxed) { return; }
+                if let SCStreamOutputType::Audio = of_type {
+                    if let Some(buf_list) = sample.audio_buffer_list() {
+                        if let Ok(mut w) = writer_c.lock() {
+                            for buf in buf_list.iter() {
+                                let bytes = buf.data();
+                                // Audio data is float32 PCM
+                                let float_samples: &[f32] = unsafe {
+                                    std::slice::from_raw_parts(
+                                        bytes.as_ptr() as *const f32,
+                                        bytes.len() / 4,
+                                    )
+                                };
+                                for &s in float_samples {
+                                    let _ = w.write_sample(s);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            SCStreamOutputType::Audio,
+        );
+
+        stream.start_capture().map_err(|e| format!("Failed to start capture: {:?}", e))?;
+
+        // Block until stop signal
+        while flag.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        stream.stop_capture().map_err(|e| format!("Failed to stop capture: {:?}", e))?;
+
+        // Finalize WAV
+        drop(stream);
+        if let Ok(w) = std::sync::Arc::try_unwrap(writer) {
+            if let Ok(w) = w.into_inner() {
+                let _ = w.finalize();
+            }
+        }
+
+        Ok(())
+    });
+
+    // Give ScreenCaptureKit a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    Ok(())
+}
+
+/// Start system audio recording via WASAPI loopback (Windows).
+#[cfg(target_os = "windows")]
+async fn start_system_audio_recording(path: &str) -> Result<(), String> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::sync::atomic::Ordering;
+
+    let path_owned = path.to_string();
+    SYSTEM_RECORDING.store(true, Ordering::SeqCst);
+
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let host = cpal::default_host();
+
+        // Get default output device and create loopback stream
+        let device = host.default_output_device()
+            .ok_or("No output device found")?;
+
+        let config = device.default_output_config()
+            .map_err(|e| format!("Config error: {}", e))?;
+
+        let spec = hound::WavSpec {
+            channels: config.channels(),
+            sample_rate: config.sample_rate().0,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(
+            hound::WavWriter::create(&path_owned, spec)
+                .map_err(|e| format!("WAV create error: {}", e))?
+        ));
+
+        let writer_c = writer.clone();
+        let flag = SYSTEM_RECORDING.clone();
+
+        let stream = device.build_input_stream(
+            &config.into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if !flag.load(Ordering::Relaxed) { return; }
+                if let Ok(mut w) = writer_c.lock() {
+                    for &sample in data { let _ = w.write_sample(sample); }
+                }
+            },
+            |e| eprintln!("Stream error: {}", e),
+            None,
+        ).map_err(|e| format!("Stream error: {}", e))?;
+
+        stream.play().map_err(|e| format!("Play error: {}", e))?;
+
+        let flag2 = SYSTEM_RECORDING.clone();
+        while flag2.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        drop(stream);
+        if let Ok(w) = std::sync::Arc::try_unwrap(writer) {
+            if let Ok(w) = w.into_inner() { let _ = w.finalize(); }
+        }
+        Ok(())
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+async fn start_system_audio_recording(_path: &str) -> Result<(), String> {
+    Err("System audio capture is not supported on this platform. Use microphone instead.".to_string())
+}
+
+#[tauri::command]
+async fn stop_recording() -> Result<String, String> {
+    // Stop system audio recording if active
+    SYSTEM_RECORDING.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Stop ffmpeg mic recording if active
+    let pid = {
+        let mut guard = RECORDING_PID.lock().await;
+        guard.take()
+    };
+    if let Some(pid) = pid {
+        unsafe { libc::kill(pid as i32, libc::SIGINT); }
+        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+        let _ = std::fs::remove_file("/tmp/flaude_recording.pid");
+    }
+
+    // Wait a moment for system audio thread to finish WAV
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let elapsed = {
+        let mut guard = RECORDING_START.lock().await;
+        let e = guard.map(|s| s.elapsed().as_secs()).unwrap_or(0);
+        *guard = None;
+        e
+    };
+
+    let path = {
+        let mut guard = RECORDING_PATH.lock().await;
+        let p = guard.clone().unwrap_or_default();
+        *guard = None;
+        p
+    };
+
+    let result = serde_json::json!({"path": path, "duration_seconds": elapsed});
+    serde_json::to_string(&result).map_err(|e| format!("JSON error: {}", e))
+}
+
+#[tauri::command]
+async fn get_recording_status() -> Result<String, String> {
+    let mic_recording = {
+        let guard = RECORDING_PID.lock().await;
+        guard.is_some()
+    };
+    let sys_recording = SYSTEM_RECORDING.load(std::sync::atomic::Ordering::Relaxed);
+    let recording = mic_recording || sys_recording;
+
+    let elapsed = {
+        let guard = RECORDING_START.lock().await;
+        guard.map(|s| s.elapsed().as_secs()).unwrap_or(0)
+    };
+    let path = {
+        let guard = RECORDING_PATH.lock().await;
+        guard.clone().unwrap_or_default()
+    };
+
+    let result = serde_json::json!({
+        "recording": recording,
+        "path": path,
+        "elapsed_seconds": elapsed,
+    });
+    serde_json::to_string(&result).map_err(|e| format!("JSON error: {}", e))
+}
+
+#[tauri::command]
+async fn recover_orphan_recording() -> Result<String, String> {
+    // Reset system recording flag
+    SYSTEM_RECORDING.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let pid_path = std::path::Path::new("/tmp/flaude_recording.pid");
+    if !pid_path.exists() {
+        return Ok(serde_json::json!({"orphan": false}).to_string());
+    }
+
+    let pid_str = std::fs::read_to_string(pid_path)
+        .map_err(|e| format!("Failed to read PID file: {}", e))?;
+    let pid: i32 = pid_str.trim().parse()
+        .map_err(|e| format!("Invalid PID: {}", e))?;
+
+    let alive = unsafe { libc::kill(pid, 0) == 0 };
+    if alive {
+        Ok(serde_json::json!({"orphan": true, "pid": pid}).to_string())
+    } else {
+        let _ = std::fs::remove_file(pid_path);
+        Ok(serde_json::json!({"orphan": false, "stale_pid": true}).to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            use tauri_plugin_global_shortcut::ShortcutState;
+            let handle = app.handle().clone();
+            app.global_shortcut().on_shortcut("CmdOrCtrl+Shift+R", move |_app, _shortcut, event| {
+                if event.state == ShortcutState::Pressed {
+                    let _ = handle.emit("toggle-recording", ());
+                }
+            })?;
+            // Check for orphan recordings on startup
+            let _ = app.handle().emit("check-orphan-recording", ());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             run_agent,
             resume_agent,
@@ -924,6 +1576,21 @@ pub fn run() {
             write_data,
             get_data_path,
             set_data_path,
+            // Meeting commands
+            check_whisper_installed,
+            check_ffmpeg_installed,
+            check_system_audio_supported,
+            install_whisper,
+            install_ffmpeg,
+            list_whisper_models,
+            download_whisper_model,
+            delete_whisper_model,
+            transcribe_audio,
+            parse_subtitle,
+            start_recording,
+            stop_recording,
+            get_recording_status,
+            recover_orphan_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

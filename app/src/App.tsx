@@ -62,6 +62,18 @@ import {
   setAuthToken,
   getAuthToken,
   SERVER_URL,
+  type Meeting,
+  type MeetingTranscript as MeetingTranscriptType,
+  type MeetingAgentResult,
+  getMeetings,
+  createMeeting,
+  deleteMeeting,
+  updateMeeting,
+  getMeetingTranscript,
+  saveMeetingTranscript,
+  updateMeetingTranscript,
+  processMeeting,
+  getMeetingResults,
 } from "./api";
 import {
   SKILL_LIBRARY,
@@ -87,7 +99,7 @@ import { AGENT_TEMPLATES, type AgentTemplate } from "./templates";
 
 // Moved to inside App component to be reactive to enabledIntegrations
 
-type Page = "chat" | "agents" | "teams" | "clients" | "settings";
+type Page = "chat" | "agents" | "teams" | "clients" | "meetings" | "settings";
 
 // ── Integration Logos (inline SVG) ──────────────────
 
@@ -441,6 +453,43 @@ function App() {
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<"admin" | "member">("member");
 
+  // Meeting
+  const [meetings, setMeetings] = useState<Meeting[]>([]);
+  const [selectedMeetingId, setSelectedMeetingId] = useState<number | null>(null);
+  const [meetingTranscript, setMeetingTranscript] = useState<MeetingTranscriptType | null>(null);
+  const [recentTranscripts, setRecentTranscripts] = useState<Record<number, string>>({});
+  const [, setMeetingResults] = useState<MeetingAgentResult[]>([]);
+  const [meetingEnabled, setMeetingEnabled] = useState(() =>
+    localStorage.getItem("flaude_meeting_enabled") === "true"
+  );
+  const [meetingProcessAgent, setMeetingProcessAgent] = useState<number | null>(null);
+  const [meetingProcessing, setMeetingProcessing] = useState(false);
+  const [editingTranscript, setEditingTranscript] = useState(false);
+  const [editTranscriptText, setEditTranscriptText] = useState("");
+
+  // Recording (Phase 2)
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingElapsed, setRecordingElapsed] = useState(0);
+  const recordingTimerRef = useRef<number | null>(null);
+
+  // Meeting Settings
+  const [whisperInstalled, setWhisperInstalled] = useState<boolean | null>(null);
+  const [ffmpegInstalled, setFfmpegInstalled] = useState<boolean | null>(null);
+  // BlackHole removed — using ScreenCaptureKit / WASAPI for system audio
+  const [whisperModels, setWhisperModels] = useState<{ name: string; size_mb: number; path: string; downloaded: boolean }[]>([]);
+  const [activeWhisperModel, setActiveWhisperModel] = useState(() =>
+    localStorage.getItem("flaude_meeting_model") || "medium"
+  );
+  const [meetingAudioSource, setMeetingAudioSource] = useState(() =>
+    localStorage.getItem("flaude_meeting_source") || "mic"
+  );
+  const [_meetingAutoDelete] = useState(() =>
+    localStorage.getItem("flaude_meeting_auto_delete") !== "false"
+  );
+  const [meetingLanguage, setMeetingLanguage] = useState(() =>
+    localStorage.getItem("flaude_meeting_language") || "ko"
+  );
+
   // Settings — persist to localStorage
   const [enabledIntegrations, setEnabledIntegrations] = useState<string[]>(() => {
     try {
@@ -479,7 +528,7 @@ function App() {
   const [mentionFilter, setMentionFilter] = useState("");
   const [mentionIndex, setMentionIndex] = useState(0);
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const chatInputRef = useRef<HTMLInputElement>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dataDir, setDataDir] = useState("");
   const [chatDataLoaded, setChatDataLoaded] = useState(false);
@@ -539,6 +588,50 @@ function App() {
   useEffect(() => { if (chatDataLoaded) invoke("write_data", { key: "active_convo", value: JSON.stringify(activeConvoId) }).catch(() => {}); }, [activeConvoId, chatDataLoaded]);
   useEffect(() => { if (chatDataLoaded) invoke("write_data", { key: "agent_chats", value: JSON.stringify(agentChats) }).catch(() => {}); }, [agentChats, chatDataLoaded]);
   useEffect(() => { if (chatDataLoaded) invoke("write_data", { key: "agent_sessions", value: JSON.stringify(agentSessions) }).catch(() => {}); }, [agentSessions, chatDataLoaded]);
+
+  // ── Recording toggle via global shortcut ──
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    listen("toggle-recording", async () => {
+      const status = await invoke<string>("get_recording_status");
+      const { recording } = JSON.parse(status);
+      if (recording) {
+        // Stop recording
+        try {
+          const res = await invoke<string>("stop_recording");
+          const data = JSON.parse(res);
+          setIsRecording(false);
+          if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+          setRecordingElapsed(0);
+          if (workspaceId) {
+            const m = await createMeeting(workspaceId, {
+              title: `${new Date().toLocaleDateString()} recording`,
+              meeting_date: new Date().toISOString(),
+              duration_seconds: data.duration_seconds,
+              audio_filename: data.path,
+              audio_source: meetingAudioSource === "system" ? "system" : "mic",
+              status: "uploaded",
+            });
+            setMeetings((prev) => [m, ...prev]);
+          }
+        } catch (e) {
+          console.error("Stop recording failed:", e);
+        }
+      } else {
+        // Start recording
+        try {
+          const path = `/tmp/flaude_recordings/${Date.now()}.wav`;
+          await invoke("start_recording", { source: meetingAudioSource, path });
+          setIsRecording(true);
+          setRecordingElapsed(0);
+          recordingTimerRef.current = window.setInterval(() => setRecordingElapsed((e) => e + 1), 1000);
+        } catch (e) {
+          alert(`Recording failed: ${e}\n\nMac: System Settings > Privacy & Security > Microphone > enable Terminal/Flaude`);
+        }
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => { if (unlisten) unlisten(); };
+  }, [workspaceId, meetingAudioSource]);
 
   // ── Knowledge Memory (local knowledge graph) ──
   type MemoryNode = {
@@ -825,7 +918,7 @@ ${agentName}: ${agentResponse.slice(0, 2000)}`;
   // Schedules
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [showScheduleForm, setShowScheduleForm] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<"general" | "integrations" | "automation" | "team" | "memory">("general");
+  const [settingsTab, setSettingsTab] = useState<"general" | "integrations" | "automation" | "team" | "memory" | "meeting">("general");
   const [scheduleForm, setScheduleForm] = useState({
     name: "", agent_id: null as number | null, team_id: null as number | null,
     cron_expression: "", prompt: "", notification_channel: "",
@@ -862,13 +955,14 @@ ${agentName}: ${agentResponse.slice(0, 2000)}`;
         let workspaces = await getWorkspaces();
         let ws = workspaces.length === 0 ? await createWorkspace("My Workspace") : workspaces[0];
         setWorkspaceId(ws.id);
-        const [a, at, c, s, wm, wi] = await Promise.all([
+        const [a, at, c, s, wm, wi, mt] = await Promise.all([
           getAgents(ws.id),
           getAgentTeams(ws.id),
           getClients(ws.id),
           getStaff(ws.id),
           getWorkspaceMembers(ws.id),
           getWorkspaceInvites(ws.id).catch(() => [] as WorkspaceInvite[]),
+          getMeetings(ws.id).catch(() => [] as Meeting[]),
         ]);
         setAgents(a);
         setAgentTeams(at);
@@ -876,6 +970,14 @@ ${agentName}: ${agentResponse.slice(0, 2000)}`;
         setStaffList(s);
         setWsMembers(wm);
         setWsInvites(wi);
+        setMeetings(mt);
+        // Preload recent meeting transcripts for chat context
+        const completed = mt.filter((m: Meeting) => m.status === "completed").slice(0, 3);
+        for (const m of completed) {
+          getMeetingTranscript(m.id).then((tr) => {
+            if (tr) setRecentTranscripts((prev) => ({ ...prev, [m.id]: tr.full_text.slice(0, 3000) }));
+          }).catch(() => {});
+        }
       } catch (e) {
         setError(`Server connection failed: ${e}`);
       } finally {
@@ -1128,24 +1230,57 @@ gws CLI가 활성화되어 있습니다. Bash 도구를 통해 아래 명령어�
 - gws calendar events update <eventId> --summary="변경된 제목"  # 일정 수정
 - gws calendar events delete <eventId>  # 일정 삭제
 
-[Drive]
-- gws drive files list --maxResults=10  # 내 드라이브 파일 목록
-- gws drive files list --driveId=<id> --corpora=drive  # 공유 드라이브 파일 목록
-- gws drive drives list  # 공유 드라이브 목록
-- gws drive files get <fileId>  # 파일 정보
-- gws drive files download <fileId> --outputPath="./downloaded.pdf"  # 파일 다운로드
-- gws drive files upload --filePath="./report.pdf" --name="보고서.pdf"  # 내 드라이브에 업로드
-- gws drive files upload --filePath="./report.pdf" --name="보고서.pdf" --parents=<folderId>  # 특정 폴더에 업로드
-- gws drive files search --query="name contains '보고서'"  # 파일 검색
+[Drive — 파일 관리]
+- gws drive files list --params='{"pageSize":10}'  # 내 드라이브 파일 목록
+- gws drive files list --params='{"q":"name contains \\'보고서\\'","pageSize":10}'  # 파일 검색
+- gws drive files list --params='{"driveId":"ID","corpora":"drive","includeItemsFromAllDrives":true,"supportsAllDrives":true}'  # 공유 드라이브 파일
+- gws drive files get --params='{"fileId":"FILE_ID","fields":"*"}'  # 파일 상세 정보
+- gws drive files download --params='{"fileId":"FILE_ID"}' -o ./downloaded.pdf  # 파일 다운로드
+- gws drive files export --params='{"fileId":"FILE_ID","mimeType":"application/pdf"}' -o ./export.pdf  # Google Docs/Sheets → PDF 내보내기
+- gws drive files export --params='{"fileId":"FILE_ID","mimeType":"text/plain"}' -o ./export.txt  # Google Docs → 텍스트 내보내기
+- gws drive +upload ./report.pdf --parent=<folderId> --name="보고서.pdf"  # 파일 업로드 (헬퍼)
+- gws drive files copy --params='{"fileId":"FILE_ID"}' --json='{"name":"복사본","parents":["FOLDER_ID"]}'  # 파일 복사
+- gws drive files update --params='{"fileId":"FILE_ID"}' --json='{"name":"새이름.pdf"}'  # 파일 이름 변경
+- gws drive files update --params='{"fileId":"FILE_ID","addParents":"FOLDER_ID","removeParents":"OLD_FOLDER_ID"}'  # 파일 이동
+- gws drive files delete --params='{"fileId":"FILE_ID"}'  # 파일 영구 삭제
 
-[Docs]
-- gws docs documents get <documentId>  # 문서 읽기
-- gws docs documents create --title="문서 제목" --body="내용"  # 문서 생성
+[Drive — 공유/권한]
+- gws drive permissions list --params='{"fileId":"FILE_ID","fields":"*"}'  # 권한 목록
+- gws drive permissions create --params='{"fileId":"FILE_ID"}' --json='{"role":"writer","type":"user","emailAddress":"email@example.com"}'  # 사용자에게 편집 권한
+- gws drive permissions create --params='{"fileId":"FILE_ID"}' --json='{"role":"reader","type":"user","emailAddress":"email@example.com"}'  # 사용자에게 읽기 권한
+- gws drive permissions create --params='{"fileId":"FILE_ID"}' --json='{"role":"reader","type":"anyone"}'  # 링크 공유 (누구나 보기)
+- gws drive permissions create --params='{"fileId":"FILE_ID"}' --json='{"role":"writer","type":"anyone"}'  # 링크 공유 (누구나 편집)
+- gws drive permissions delete --params='{"fileId":"FILE_ID","permissionId":"PERM_ID"}'  # 권한 삭제
+- gws drive permissions update --params='{"fileId":"FILE_ID","permissionId":"PERM_ID"}' --json='{"role":"reader"}'  # 권한 변경
+
+[Drive — 공유 드라이브]
+- gws drive drives list  # 공유 드라이브 목록
+- gws drive drives get --params='{"driveId":"DRIVE_ID"}'  # 공유 드라이브 정보
+- gws drive drives create --params='{"requestId":"unique-id"}' --json='{"name":"새 공유 드라이브"}'  # 공유 드라이브 생성
+
+[Drive — 댓글]
+- gws drive comments list --params='{"fileId":"FILE_ID","fields":"*"}'  # 파일 댓글 목록
+- gws drive comments create --params='{"fileId":"FILE_ID"}' --json='{"content":"댓글 내용"}'  # 댓글 작성
+- gws drive replies create --params='{"fileId":"FILE_ID","commentId":"COMMENT_ID"}' --json='{"content":"답글 내용"}'  # 답글 작성
+
+[Drive — 변경 이력]
+- gws drive changes list --params='{"pageToken":"TOKEN"}'  # 최근 변경 이력
+- gws drive changes getStartPageToken  # 변경 추적 시작 토큰
+- gws drive revisions list --params='{"fileId":"FILE_ID"}'  # 파일 버전 이력
+
+[Docs — 문서]
+- gws docs documents get --params='{"documentId":"DOC_ID"}'  # 문서 읽기
+- gws docs documents create --json='{"title":"문서 제목"}'  # 문서 생성
+- gws docs +write <documentId> --body="추가할 텍스트"  # 문서에 텍스트 추가 (헬퍼)
+- gws docs documents batchUpdate --params='{"documentId":"DOC_ID"}' --json='{"requests":[{"insertText":{"location":{"index":1},"text":"삽입할 내용"}}]}'  # 문서 수정
+- gws docs documents batchUpdate --params='{"documentId":"DOC_ID"}' --json='{"requests":[{"replaceAllText":{"containsText":{"text":"찾을텍스트","matchCase":true},"replaceText":"바꿀텍스트"}}]}'  # 텍스트 치환
 
 주의사항:
-- 역할에 맞는 gws 명령어만 사용하세요
+- gws 명령어의 파라미터는 --params(URL 파라미터)와 --json(요청 본문)으로 구분
+- 파일 다운로드/내보내기 시 -o 옵션으로 저장 경로 지정
+- 공유 드라이브 파일 접근 시 supportsAllDrives=true 필수
 - 이메일 발송 시 수신자를 반드시 확인하세요
-- 중요 작업 전 사용자에게 확인을 구하세요${driveFolders.length > 0 ? `
+- 중요 작업(삭제, 권한 변경) 전 사용자에게 확인을 구하세요${driveFolders.length > 0 ? `
 
 [등록된 Drive 폴더]
 ${driveFolders.map((f) => `- "${f.label}": folderId=${f.folderId}${f.driveId ? `, driveId=${f.driveId} (공유 드라이브)` : " (내 드라이브)"}`).join("\n")}
@@ -1211,6 +1346,20 @@ ${relevantMemories}` : "";
       ? `\n\n=== 회사 구성원 연락처 ===\n${staffList.map((s) => `- ${s.name}${s.role ? ` (${s.role})` : ""}${s.email ? ` — 이메일: ${s.email}` : ""}${s.phone ? ` — 전화: ${s.phone}` : ""}${s.notes ? ` — 메모: ${s.notes}` : ""}`).join("\n")}\n\n이메일이나 연락처가 필요하면 위 목록을 참고하세요. 절대로 사용자에게 다시 물어보지 마세요.`
       : "";
 
+    // Inject recent meeting transcripts for chat context
+    const recentMeetings = meetings
+      .filter((m) => m.status === "completed")
+      .slice(0, 3);
+    const meetingEntries = recentMeetings.map((m) => {
+      const text = recentTranscripts[m.id];
+      return text
+        ? `[${m.title}] (${new Date(m.meeting_date).toLocaleDateString()})\n${text}`
+        : `[${m.title}] (${new Date(m.meeting_date).toLocaleDateString()})`;
+    });
+    const meetingSection = meetingEntries.length > 0
+      ? `\n\n=== 최근 회의록 ===\n사용자가 회의, 회의록, 미팅, 요약 등을 언급하면 아래 내용을 참고하세요.\n\n` + meetingEntries.join("\n\n---\n\n")
+      : "";
+
     return `${agent.instructions}
 
 === 팀 컨텍스트 ===
@@ -1221,7 +1370,7 @@ ${relevantMemories}` : "";
 당신의 역할: ${agent.role}
 같은 팀 동료:
 ${teammateInfo}${staffInfo}
-${gwsSection}${hallucinationGuard}${savePathSection}${memorySection}
+${gwsSection}${hallucinationGuard}${savePathSection}${memorySection}${meetingSection}
 
 참고: 동료의 작업 결과를 전달받으면 그 맥락을 이해하고 이어서 작업하세요.
 사용자가 다른 팀원의 결과를 언급하면 그 정보를 활용하세요.`;
@@ -2193,8 +2342,20 @@ ${hasBash ? `
         <div className="p-4 border-b border-gray-200">
           <h1 className="text-xl font-serif font-bold text-[#D97706]">Flaude</h1>
         </div>
+        {/* Recording status bar */}
+        {isRecording && (
+          <div className="px-4 py-2 bg-red-50 border-b border-red-200">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+              <span className="text-xs font-mono text-red-600">
+                {String(Math.floor(recordingElapsed / 60)).padStart(2, "0")}:{String(recordingElapsed % 60).padStart(2, "0")}
+              </span>
+            </div>
+            <div className="text-[10px] text-red-400 mt-0.5">Cmd+Shift+R {t("meeting.recordStop")}</div>
+          </div>
+        )}
         <nav className="flex-1 p-2">
-          {(["chat", "agents", "teams", "clients"] as Page[]).map((page) => (
+          {(["chat", "agents", "teams", "clients", ...(meetingEnabled ? ["meetings" as Page] : [])] as Page[]).map((page) => (
             <button
               key={page}
               onClick={() => {
@@ -2215,6 +2376,7 @@ ${hasBash ? `
               {page === "agents" && t("nav.members")}
               {page === "teams" && t("nav.teams")}
               {page === "clients" && t("nav.clients")}
+              {page === "meetings" && t("nav.meetings")}
             </button>
           ))}
         </nav>
@@ -2588,20 +2750,33 @@ ${hasBash ? `
                             </svg>
                           </button>
                           <input type="file" ref={fileInputRef} className="hidden" multiple onChange={(e) => handleFileUpload(e.target.files)} />
-                          <input
+                          <textarea
                             ref={chatInputRef}
-                            type="text"
                             value={prompt}
-                            onChange={(e) => handleChatInputChange(e.target.value)}
+                            onChange={(e) => {
+                              handleChatInputChange(e.target.value);
+                              // Auto-resize
+                              e.target.style.height = "auto";
+                              e.target.style.height = Math.min(e.target.scrollHeight, 160) + "px";
+                            }}
                             onKeyDown={(e) => {
-                              if (!showMentionPicker) return;
-                              const allMentionItems = [...filteredMentionAgents.map((a) => a.name), ...filteredMentionTeams.map((t) => t.name)];
-                              if (e.key === "Escape") { setShowMentionPicker(false); e.preventDefault(); return; }
-                              if (e.key === "ArrowDown") { e.preventDefault(); setMentionIndex((i) => Math.min(i + 1, allMentionItems.length - 1)); return; }
-                              if (e.key === "ArrowUp") { e.preventDefault(); setMentionIndex((i) => Math.max(i - 1, 0)); return; }
-                              if ((e.key === "Enter" || e.key === "Tab") && allMentionItems.length > 0) {
+                              if (showMentionPicker) {
+                                const allMentionItems = [...filteredMentionAgents.map((a) => a.name), ...filteredMentionTeams.map((t) => t.name)];
+                                if (e.key === "Escape") { setShowMentionPicker(false); e.preventDefault(); return; }
+                                if (e.key === "ArrowDown") { e.preventDefault(); setMentionIndex((i) => Math.min(i + 1, allMentionItems.length - 1)); return; }
+                                if (e.key === "ArrowUp") { e.preventDefault(); setMentionIndex((i) => Math.max(i - 1, 0)); return; }
+                                if ((e.key === "Enter" || e.key === "Tab") && allMentionItems.length > 0) {
+                                  e.preventDefault();
+                                  insertMention(allMentionItems[mentionIndex] || allMentionItems[0]);
+                                  return;
+                                }
+                              }
+                              // Enter to send (Shift+Enter for newline)
+                              if (e.key === "Enter" && !e.shiftKey) {
                                 e.preventDefault();
-                                insertMention(allMentionItems[mentionIndex] || allMentionItems[0]);
+                                handleChatSend();
+                                // Reset height
+                                (e.target as HTMLTextAreaElement).style.height = "auto";
                               }
                             }}
                             placeholder={(() => {
@@ -2609,7 +2784,9 @@ ${hasBash ? `
                               if (lastAgent) return lang === "ko" ? `${lastAgent.name}에게 메시지...` : `Message ${lastAgent.name}...`;
                               return lang === "ko" ? `@${activeAgents[0]?.name || "팀원"} 또는 @${agentTeams[0]?.name || "팀"} 메시지 입력...` : `@${activeAgents[0]?.name || "agent"} or @${agentTeams[0]?.name || "team"} type a message...`;
                             })()}
-                            className="flex-1 px-1 py-2.5 text-sm bg-transparent focus:outline-none placeholder:text-[#C4C4C0]"
+                            rows={1}
+                            className="flex-1 px-1 py-2.5 text-sm bg-transparent focus:outline-none placeholder:text-[#C4C4C0] resize-none overflow-hidden"
+                            style={{ maxHeight: 160 }}
                           />
                           {chatRunningAgent ? (
                             <button
@@ -2626,7 +2803,11 @@ ${hasBash ? `
                             <button
                               type="submit"
                               disabled={!prompt.trim()}
-                              className="px-3 py-2.5 text-[#9CA3AF] hover:text-[#D97706] disabled:opacity-30 transition flex-shrink-0"
+                              className={`px-3 py-2.5 transition flex-shrink-0 ${
+                                prompt.trim()
+                                  ? "text-[#D97706] hover:text-[#B45309]"
+                                  : "text-[#D1D5DB]"
+                              }`}
                             >
                               <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
                                 <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
@@ -3743,7 +3924,7 @@ ${hasBash ? `
                           )}
                         </div>
                         <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-                          <select value={client.status} onChange={(e) => handleUpdateClientStatus(client.id, e.target.value)} className="text-xs border border-gray-300 rounded px-2 py-1 focus:outline-none focus:border-[#D97706]">
+                          <select value={client.status} onChange={(e) => handleUpdateClientStatus(client.id, e.target.value)} className="text-xs px-2 py-1">
                             {CLIENT_STATUSES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
                           </select>
                         </div>
@@ -3785,7 +3966,7 @@ ${hasBash ? `
                             <div className="flex items-center gap-3">
                               <div className="flex-1">
                                 <label className="text-[10px] text-[#9CA3AF] block mb-1">{t("client.assignAgent")}</label>
-                                <select value={client.assigned_agent} onChange={(e) => handleAssignAgent(client.id, e.target.value)} className="text-xs border border-gray-300 rounded-lg px-2.5 py-1.5 w-full focus:outline-none focus:border-[#D97706]">
+                                <select value={client.assigned_agent} onChange={(e) => handleAssignAgent(client.id, e.target.value)} className="text-xs px-2.5 py-1.5 w-full">
                                   <option value="">{t("client.none")}</option>
                                   {activeAgents.map((a) => <option key={a.id} value={a.name}>{a.name} ({a.role})</option>)}
                                 </select>
@@ -3870,6 +4051,433 @@ ${hasBash ? `
           </div>
         )}
 
+        {/* ═══ MEETINGS ═══ */}
+        {currentPage === "meetings" && (() => {
+          // Helper: auto-transcribe a meeting
+          // Fire-and-forget transcription — runs in background, doesn't block UI
+          const autoTranscribe = (meetingId: number, audioPath: string) => {
+            updateMeeting(meetingId, { status: "transcribing" });
+            setMeetings((prev) => prev.map((x) => x.id === meetingId ? { ...x, status: "transcribing" } : x));
+
+            // Run transcription without awaiting — user can record another meeting
+            (async () => {
+              try {
+                const result = await invoke<string>("transcribe_audio", {
+                  path: audioPath, model: activeWhisperModel, language: meetingLanguage,
+                });
+                const parsed = JSON.parse(result);
+                const rawSegs = parsed.transcription || parsed.segments || [];
+                const segments = rawSegs.map((s: any) => ({
+                  start: s.offsets ? s.offsets.from / 1000 : (s.start || 0),
+                  end: s.offsets ? s.offsets.to / 1000 : (s.end || 0),
+                  text: (s.text || "").trim(),
+                }));
+                const fullText = segments.map((s: any) => s.text).join(" ");
+                await saveMeetingTranscript(meetingId, { full_text: fullText, segments, language: meetingLanguage });
+                const autoTitle = fullText.slice(0, 40).replace(/\s+/g, " ").trim() || `${lang === "ko" ? "회의" : "Meeting"} ${new Date().toLocaleDateString()}`;
+                await updateMeeting(meetingId, { status: "completed", title: autoTitle } as any);
+                setMeetings((prev) => prev.map((x) => x.id === meetingId ? { ...x, status: "completed", title: autoTitle } : x));
+                // Update transcript view if this meeting is currently selected
+                setSelectedMeetingId((cur) => { if (cur === meetingId) setMeetingTranscript({ id: 0, full_text: fullText, segments, language: meetingLanguage }); return cur; });
+                setRecentTranscripts((prev) => ({ ...prev, [meetingId]: fullText.slice(0, 3000) }));
+              } catch (e) {
+                await updateMeeting(meetingId, { status: "failed", error_message: String(e) });
+                setMeetings((prev) => prev.map((x) => x.id === meetingId ? { ...x, status: "failed" } : x));
+              }
+            })();
+          };
+
+          // Helper: send meeting to chat
+          const sendToChat = (agent: Agent, meetingTitle: string, processingType: string, prompt: string) => {
+            const convoId = createConvo();
+            const label = { summary: "요약", action_items: "액션 아이템", follow_up_email: "팔로업 메일", proposal: "제안서" }[processingType] || processingType;
+            const userMsg: ChatMsg = { role: "user", text: `[${meetingTitle}] ${label} 요청`, ts: Date.now() };
+            updateConvo(convoId, (c) => ({ ...c, title: `${meetingTitle} - ${label}`, messages: [userMsg], lastAgentId: agent.id }));
+            setSelectedAgent(agent);
+            setCurrentPage("chat");
+            // Trigger agent run via prompt
+            setTimeout(() => setPrompt(prompt), 100);
+          };
+
+          return (
+          <div className="flex h-full">
+            {/* Meeting list */}
+            <div className="w-72 border-r border-gray-200 bg-white flex flex-col">
+              <div className="p-4 border-b border-gray-200">
+                <h2 className="text-lg font-bold mb-3">{t("meeting.title")}</h2>
+                {/* Big record button */}
+                {isRecording ? (
+                  <button
+                    onClick={async () => {
+                      try {
+                        const res = await invoke<string>("stop_recording");
+                        const data = JSON.parse(res);
+                        setIsRecording(false);
+                        if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+                        setRecordingElapsed(0);
+                        if (workspaceId) {
+                          const now = new Date();
+                          const m = await createMeeting(workspaceId, {
+                            title: `${lang === "ko" ? "녹음 중..." : "Processing..."}`,
+                            meeting_date: now.toISOString(),
+                            duration_seconds: data.duration_seconds,
+                            audio_filename: data.path,
+                            audio_source: meetingAudioSource === "system" ? "system" : "mic",
+                            status: "uploaded",
+                          });
+                          setMeetings((prev) => [m, ...prev]);
+                          setSelectedMeetingId(m.id);
+                          autoTranscribe(m.id, data.path);
+                        }
+                      } catch (e) {
+                        alert(`${lang === "ko" ? "녹음 중지 실패" : "Stop failed"}: ${e}`);
+                      }
+                    }}
+                    className="w-full py-3 bg-red-500 text-white text-sm font-medium rounded-lg hover:bg-red-600 flex items-center justify-center gap-2 mb-2"
+                  >
+                    <span className="w-3 h-3 rounded-full bg-white animate-pulse" />
+                    {t("meeting.recordStop")} ({String(Math.floor(recordingElapsed / 60)).padStart(2, "0")}:{String(recordingElapsed % 60).padStart(2, "0")})
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      onClick={async () => {
+                        try {
+                          const path = `/tmp/flaude_recordings/${Date.now()}.wav`;
+                          await invoke<string>("start_recording", { source: meetingAudioSource, path });
+                          setIsRecording(true);
+                          setRecordingElapsed(0);
+                          recordingTimerRef.current = window.setInterval(() => setRecordingElapsed((e) => e + 1), 1000);
+                        } catch (e) {
+                          alert(`${lang === "ko" ? "녹음 실패" : "Recording failed"}: ${e}\n\n${lang === "ko" ? "시스템 설정 > 개인정보 보호 > 마이크에서 허용해주세요" : "System Settings > Privacy > Microphone > enable"}`);
+                        }
+                      }}
+                      className="w-full py-3 bg-red-50 text-red-600 text-sm font-medium rounded-lg hover:bg-red-100 border border-red-200 mb-1"
+                    >
+                      {t("meeting.record")}
+                    </button>
+                    {/* Quick source toggle */}
+                    <div className="flex mb-2 rounded-md overflow-hidden border border-gray-200">
+                      {([
+                        { v: "mic", ko: "대면 회의", en: "In-person" },
+                        { v: "system", ko: "화상 회의", en: "Video call" },
+                      ] as const).map((opt) => (
+                        <button
+                          key={opt.v}
+                          onClick={() => { setMeetingAudioSource(opt.v); localStorage.setItem("flaude_meeting_source", opt.v); }}
+                          className={`flex-1 py-1 text-[11px] transition ${
+                            meetingAudioSource === opt.v
+                              ? "bg-gray-800 text-white"
+                              : "bg-white text-gray-400 hover:text-gray-600"
+                          }`}
+                        >
+                          {lang === "ko" ? opt.ko : opt.en}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+                {/* File actions */}
+                <div className="flex gap-2">
+                  <label className="flex-1 px-3 py-1.5 bg-gray-50 text-gray-500 text-xs rounded hover:bg-gray-100 border border-gray-200 text-center cursor-pointer">
+                    {lang === "ko" ? "파일 업로드" : "Upload File"}
+                    <input type="file" accept=".mp3,.m4a,.wav,.ogg" className="hidden" onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      if (!file || !workspaceId) return;
+                      const reader = new FileReader();
+                      reader.onload = async () => {
+                        const base64 = (reader.result as string).split(",")[1];
+                        const path = await invoke<string>("save_chat_file", { fileName: file.name, fileDataBase64: base64 });
+                        const m = await createMeeting(workspaceId, {
+                          title: file.name.replace(/\.[^.]+$/, ""),
+                          meeting_date: new Date().toISOString(),
+                          audio_filename: path, audio_source: "upload", status: "uploaded",
+                        });
+                        setMeetings((prev) => [m, ...prev]);
+                        setSelectedMeetingId(m.id);
+                      };
+                      reader.readAsDataURL(file);
+                    }} />
+                  </label>
+                  <label className="flex-1 px-3 py-1.5 bg-gray-50 text-gray-500 text-xs rounded hover:bg-gray-100 border border-gray-200 text-center cursor-pointer">
+                    {lang === "ko" ? "자막/텍스트" : "Subtitle/Text"}
+                    <input type="file" accept=".vtt,.srt,.txt" className="hidden" onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      if (!file || !workspaceId) return;
+                      if (file.name.endsWith(".txt")) {
+                        const text = await file.text();
+                        const autoTitle = text.slice(0, 40).replace(/\s+/g, " ").trim() || file.name;
+                        const m = await createMeeting(workspaceId, { title: autoTitle, meeting_date: new Date().toISOString(), audio_source: "import", status: "completed" });
+                        await saveMeetingTranscript(m.id, { full_text: text, segments: [], language: meetingLanguage });
+                        setMeetings((prev) => [{ ...m, status: "completed" }, ...prev]);
+                        setSelectedMeetingId(m.id);
+                      } else {
+                        const reader = new FileReader();
+                        reader.onload = async () => {
+                          const base64 = (reader.result as string).split(",")[1];
+                          const path = await invoke<string>("save_chat_file", { fileName: file.name, fileDataBase64: base64 });
+                          const parsed = await invoke<string>("parse_subtitle", { path });
+                          const data = JSON.parse(parsed);
+                          const autoTitle = data.full_text.slice(0, 40).replace(/\s+/g, " ").trim() || file.name;
+                          const m = await createMeeting(workspaceId, { title: autoTitle, meeting_date: new Date().toISOString(), audio_source: "import", status: "completed" });
+                          await saveMeetingTranscript(m.id, { full_text: data.full_text, segments: data.segments, language: meetingLanguage });
+                          setMeetings((prev) => [{ ...m, status: "completed" }, ...prev]);
+                          setSelectedMeetingId(m.id);
+                        };
+                        reader.readAsDataURL(file);
+                      }
+                    }} />
+                  </label>
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto">
+                {meetings.length === 0 ? (
+                  <div className="p-6 text-center">
+                    <p className="text-sm text-gray-400">{lang === "ko" ? "녹음하거나 파일을 업로드하세요" : "Record or upload a file"}</p>
+                  </div>
+                ) : (
+                  meetings.map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={async () => {
+                        setSelectedMeetingId(m.id);
+                        setMeetingTranscript(null);
+                        setMeetingResults([]);
+                        setEditingTranscript(false);
+                        try {
+                          const [tr, res] = await Promise.all([
+                            getMeetingTranscript(m.id).catch(() => null),
+                            getMeetingResults(m.id).catch(() => []),
+                          ]);
+                          setMeetingTranscript(tr);
+                          setMeetingResults(res);
+                        } catch {}
+                      }}
+                      className={`w-full text-left px-4 py-3 border-b border-gray-100 hover:bg-gray-50 ${
+                        selectedMeetingId === m.id ? "bg-[#D97706]/5 border-l-2 border-l-[#D97706]" : ""
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium truncate">{m.title}</span>
+                        <span className="flex-shrink-0 ml-2">
+                          {m.status === "completed" && <span className="w-2 h-2 rounded-full bg-green-400 inline-block" />}
+                          {m.status === "transcribing" && <span className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse inline-block" />}
+                          {m.status === "failed" && <span className="w-2 h-2 rounded-full bg-red-400 inline-block" />}
+                          {m.status === "recording" && <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse inline-block" />}
+                          {m.status === "uploaded" && <span className="w-2 h-2 rounded-full bg-gray-300 inline-block" />}
+                        </span>
+                      </div>
+                      <div className="text-xs text-gray-400 mt-0.5">
+                        {new Date(m.meeting_date).toLocaleDateString()} {new Date(m.meeting_date).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                        {m.duration_seconds ? <span className="ml-2">{Math.round(m.duration_seconds / 60)}{t("meeting.minutes")}</span> : null}
+                      </div>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* Meeting detail */}
+            <div className="flex-1 overflow-y-auto">
+              {selectedMeetingId ? (() => {
+                const meeting = meetings.find((m) => m.id === selectedMeetingId);
+                if (!meeting) return null;
+                return (
+                  <div className="p-6 max-w-3xl">
+                    {/* Header */}
+                    <div className="flex items-start justify-between mb-1">
+                      <h2 className="text-xl font-bold">{meeting.title}</h2>
+                      <button
+                        onClick={async () => {
+                          if (!confirm(lang === "ko" ? "이 회의를 삭제할까요?" : "Delete this meeting?")) return;
+                          await deleteMeeting(meeting.id);
+                          setMeetings((prev) => prev.filter((x) => x.id !== meeting.id));
+                          setSelectedMeetingId(null);
+                        }}
+                        className="px-2 py-1 text-xs text-gray-400 hover:text-red-500"
+                      >
+                        {t("meeting.delete")}
+                      </button>
+                    </div>
+                    <div className="text-xs text-gray-400 mb-4">
+                      {new Date(meeting.meeting_date).toLocaleString()}
+                      {meeting.duration_seconds ? ` / ${Math.round(meeting.duration_seconds / 60)}${t("meeting.minutes")}` : ""}
+                      {meeting.participants.length > 0 ? ` / ${meeting.participants.join(", ")}` : ""}
+                    </div>
+
+                    {/* Status banner for non-completed */}
+                    {meeting.status === "transcribing" && (
+                      <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg text-sm text-yellow-700 flex items-center gap-2">
+                        {lang === "ko" ? "음성을 텍스트로 변환 중입니다..." : "Converting speech to text..."}
+                      </div>
+                    )}
+                    {meeting.status === "uploaded" && (
+                      <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg text-sm text-blue-700">
+                        <p className="mb-2">{lang === "ko" ? "음성 파일이 업로드되었습니다. 전사를 시작하세요." : "Audio uploaded. Start transcription."}</p>
+                        <button
+                          onClick={() => autoTranscribe(meeting.id, meeting.audio_filename)}
+                          className="px-3 py-1 bg-blue-600 text-white text-xs rounded hover:bg-blue-700"
+                        >
+                          {lang === "ko" ? "전사 시작" : "Start Transcription"}
+                        </button>
+                      </div>
+                    )}
+                    {meeting.status === "failed" && (
+                      <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-600">
+                        {lang === "ko" ? "전사에 실패했습니다." : "Transcription failed."}
+                        {meeting.error_message && <pre className="mt-1 text-xs whitespace-pre-wrap">{meeting.error_message}</pre>}
+                        <button
+                          onClick={() => autoTranscribe(meeting.id, meeting.audio_filename)}
+                          className="mt-2 px-3 py-1 bg-red-600 text-white text-xs rounded hover:bg-red-700"
+                        >
+                          {t("meeting.retranscribe")}
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Transcript */}
+                    {meetingTranscript && (
+                      <div className="mb-6">
+                        <div className="flex items-center justify-between mb-2">
+                          <h3 className="text-sm font-semibold text-gray-700">{t("meeting.transcript")}</h3>
+                          <div className="flex gap-1">
+                            {editingTranscript ? (
+                              <>
+                                <button onClick={async () => {
+                                  await updateMeetingTranscript(meeting.id, { full_text: editTranscriptText });
+                                  setMeetingTranscript((prev) => prev ? { ...prev, full_text: editTranscriptText } : prev);
+                                  setEditingTranscript(false);
+                                }} className="px-2 py-0.5 text-xs bg-[#D97706] text-white rounded">{t("meeting.save")}</button>
+                                <button onClick={() => setEditingTranscript(false)} className="px-2 py-0.5 text-xs text-gray-500 border rounded">{t("meeting.cancel")}</button>
+                              </>
+                            ) : (
+                              <>
+                                <button onClick={() => { setEditingTranscript(true); setEditTranscriptText(meetingTranscript.full_text); }} className="px-2 py-0.5 text-xs text-gray-400 hover:text-gray-600">{t("meeting.edit")}</button>
+                                <button onClick={() => navigator.clipboard.writeText(meetingTranscript.full_text)} className="px-2 py-0.5 text-xs text-gray-400 hover:text-gray-600">{t("meeting.copy")}</button>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                        {editingTranscript ? (
+                          <textarea value={editTranscriptText} onChange={(e) => setEditTranscriptText(e.target.value)} className="w-full h-64 p-3 border rounded text-sm font-mono" />
+                        ) : (
+                          <div className="bg-gray-50 rounded-lg p-4 max-h-72 overflow-y-auto text-sm leading-relaxed">
+                            {meetingTranscript.segments.length > 0 ? (
+                              meetingTranscript.segments.map((seg, i) => (
+                                <div key={i} className="mb-1.5">
+                                  <span className="text-[10px] text-gray-300 font-mono mr-1.5">
+                                    {String(Math.floor(seg.start / 60)).padStart(2, "0")}:{String(Math.floor(seg.start % 60)).padStart(2, "0")}
+                                  </span>
+                                  <span>{seg.text}</span>
+                                </div>
+                              ))
+                            ) : (
+                              <pre className="whitespace-pre-wrap">{meetingTranscript.full_text}</pre>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Agent actions — step 1: pick agent, step 2: pick action */}
+                    {meetingTranscript && (
+                      <div className="mb-6">
+                        <h3 className="text-sm font-semibold text-gray-700 mb-3">{lang === "ko" ? "회의록 활용하기" : "Use this transcript"}</h3>
+
+                        {/* Step 1: Select agent or team */}
+                        <div className="mb-3">
+                          <p className="text-xs text-gray-400 mb-2">{lang === "ko" ? "누구에게 맡길까요?" : "Who should handle this?"}</p>
+                          <div className="flex flex-wrap gap-2">
+                            {agents.filter((a) => a.status === "active").map((a) => (
+                              <button
+                                key={`agent-${a.id}`}
+                                onClick={() => setMeetingProcessAgent(a.id)}
+                                className={`px-3 py-2.5 rounded-lg border text-sm flex items-center gap-2.5 transition ${
+                                  meetingProcessAgent === a.id
+                                    ? "border-[#D97706] bg-[#D97706]/5 shadow-sm"
+                                    : "border-gray-200 hover:border-gray-300 hover:shadow-sm"
+                                }`}
+                              >
+                                <img src={avatarUrl(a.name)} className="w-7 h-7 rounded-full object-cover" />
+                                <div className="text-left">
+                                  <div className={`text-sm font-medium ${meetingProcessAgent === a.id ? "text-[#D97706]" : "text-gray-800"}`}>{a.name}</div>
+                                  <div className="text-[10px] text-gray-400 leading-tight">{a.role}</div>
+                                </div>
+                              </button>
+                            ))}
+                            {agentTeams.map((team) => (
+                              <button
+                                key={`team-${team.id}`}
+                                onClick={() => setMeetingProcessAgent(-team.id)}
+                                className={`px-3 py-2.5 rounded-lg border text-sm flex items-center gap-2.5 transition ${
+                                  meetingProcessAgent === -team.id
+                                    ? "border-[#D97706] bg-[#D97706]/5 shadow-sm"
+                                    : "border-gray-200 hover:border-gray-300 hover:shadow-sm"
+                                }`}
+                              >
+                                <span className="w-7 h-7 rounded-full bg-gray-100 flex items-center justify-center text-xs font-medium text-gray-500">{team.members.length}</span>
+                                <div className="text-left">
+                                  <div className={`text-sm font-medium ${meetingProcessAgent === -team.id ? "text-[#D97706]" : "text-gray-800"}`}>{team.name}</div>
+                                  <div className="text-[10px] text-gray-400 leading-tight">{lang === "ko" ? "팀" : "Team"}</div>
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Step 2: Select action (only shown after agent selected) */}
+                        {meetingProcessAgent && (
+                          <div>
+                            <p className="text-xs text-gray-400 mb-2">{lang === "ko" ? "무엇을 할까요?" : "What should they do?"}</p>
+                            <div className="grid grid-cols-2 gap-2">
+                              {([
+                                { type: "summary", ko: "요약하기", en: "Summarize" },
+                                { type: "action_items", ko: "액션 아이템 추출", en: "Action Items" },
+                                { type: "follow_up_email", ko: "팔로업 메일 작성", en: "Follow-up Email" },
+                                { type: "proposal", ko: "제안서 초안", en: "Draft Proposal" },
+                              ] as const).map((action) => (
+                                <button
+                                  key={action.type}
+                                  disabled={meetingProcessing}
+                                  onClick={async () => {
+                                    const agentId = meetingProcessAgent > 0 ? meetingProcessAgent : null;
+                                    const agent = agentId ? agents.find((a) => a.id === agentId) : agents.find((a) => a.status === "active");
+                                    if (!agent) { alert(lang === "ko" ? "에이전트를 찾을 수 없습니다" : "Agent not found"); return; }
+                                    setMeetingProcessing(true);
+                                    try {
+                                      const resp = await processMeeting(meeting.id, { agent_id: agent.id, processing_type: action.type });
+                                      sendToChat(agent, meeting.title, action.type, resp.prompt);
+                                    } catch (e) {
+                                      alert(`${lang === "ko" ? "처리 실패" : "Failed"}: ${e}`);
+                                    } finally {
+                                      setMeetingProcessing(false);
+                                    }
+                                  }}
+                                  className="p-3 bg-white border border-gray-200 rounded-lg hover:border-[#D97706] hover:bg-[#D97706]/5 text-sm text-left disabled:opacity-50 transition"
+                                >
+                                  {lang === "ko" ? action.ko : action.en}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Results link to chat */}
+                  </div>
+                );
+              })() : (
+                <div className="flex flex-col items-center justify-center h-full text-gray-400">
+                  <p className="text-sm">{lang === "ko" ? "회의를 녹음하거나 선택하세요" : "Record or select a meeting"}</p>
+                  <p className="text-xs mt-1 text-gray-300">Cmd+Shift+R</p>
+                </div>
+              )}
+            </div>
+          </div>
+          );
+        })()}
+
         {/* ═══ SETTINGS ═══ */}
         {currentPage === "settings" && (
           <div className="p-6">
@@ -3917,6 +4525,7 @@ ${hasBash ? `
                 { key: "automation" as const, ko: "자동화", en: "Automation" },
                 { key: "team" as const, ko: "팀 관리", en: "Team" },
                 { key: "memory" as const, ko: "메모리", en: "Memory" },
+                { key: "meeting" as const, ko: "회의", en: "Meeting" },
               ]).map((tab) => (
                 <button
                   key={tab.key}
@@ -4093,7 +4702,7 @@ ${hasBash ? `
               <div className="p-4 bg-white rounded-lg border border-gray-200">
                 <h3 className="text-sm font-medium mb-2">{t("settings.server")}</h3>
                 <div className="flex justify-between text-xs">
-                  <span className="text-[#6B7280]">flaude.com</span>
+                  <span className="text-[#6B7280]">flaude.team</span>
                   <span className={error ? "text-red-500" : "text-[#059669]"}>
                     {error ? t("settings.disconnected") : t("settings.connected")}
                   </span>
@@ -4282,7 +4891,7 @@ ${hasBash ? `
                     <div className="grid grid-cols-2 gap-2">
                       <div>
                         <label className="text-[10px] text-[#9CA3AF] block mb-1">{lang === "ko" ? "스케줄 이름" : "Schedule Name"}</label>
-                        <input type="text" placeholder={lang === "ko" ? "예: 매일 아침 리서치" : "e.g. Daily research"} value={scheduleForm.name} onChange={(e) => setScheduleForm({ ...scheduleForm, name: e.target.value })} className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-[#D97706]" />
+                        <input type="text" placeholder={lang === "ko" ? "예: 매일 아침 리서치" : "e.g. Daily research"} value={scheduleForm.name} onChange={(e) => setScheduleForm({ ...scheduleForm, name: e.target.value })} className="w-full px-3 py-1.5 text-sm" />
                       </div>
                       <div>
                         <label className="text-[10px] text-[#9CA3AF] block mb-1">{lang === "ko" ? "얼마나 자주?" : "How often?"}</label>
@@ -4295,7 +4904,7 @@ ${hasBash ? `
                               setScheduleForm({ ...scheduleForm, cron_expression: e.target.value });
                             }
                           }}
-                          className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-[#D97706]"
+                          className="w-full px-3 py-1.5 text-sm"
                         >
                           <option value="">{lang === "ko" ? "선택하세요..." : "Select..."}</option>
                           {SCHEDULE_PRESETS.map((p) => (
@@ -4323,7 +4932,7 @@ ${hasBash ? `
                           if (v.startsWith("agent:")) setScheduleForm({ ...scheduleForm, agent_id: Number(v.split(":")[1]), team_id: null });
                           else if (v.startsWith("team:")) setScheduleForm({ ...scheduleForm, agent_id: null, team_id: Number(v.split(":")[1]) });
                           else setScheduleForm({ ...scheduleForm, agent_id: null, team_id: null });
-                        }} className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-[#D97706]">
+                        }} className="w-full px-3 py-1.5 text-sm">
                           <option value="">{lang === "ko" ? "팀원 또는 팀 선택..." : "Select member or team..."}</option>
                           {activeAgents.map((a) => <option key={`a-${a.id}`} value={`agent:${a.id}`}>{a.name} ({a.role})</option>)}
                           {agentTeams.map((tm) => <option key={`t-${tm.id}`} value={`team:${tm.id}`}>{lang === "ko" ? "팀" : "Team"}: {tm.name}</option>)}
@@ -4336,7 +4945,7 @@ ${hasBash ? `
                     </div>
                     <div>
                       <label className="text-[10px] text-[#9CA3AF] block mb-1">{lang === "ko" ? "무슨 일을 시킬까요?" : "What should they do?"}</label>
-                      <textarea value={scheduleForm.prompt} onChange={(e) => setScheduleForm({ ...scheduleForm, prompt: e.target.value })} placeholder={lang === "ko" ? "예: 오늘의 주요 뉴스를 조사해서 보고해줘" : "e.g. Research today's key news and report"} className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-[#D97706]" rows={2} />
+                      <textarea value={scheduleForm.prompt} onChange={(e) => setScheduleForm({ ...scheduleForm, prompt: e.target.value })} placeholder={lang === "ko" ? "예: 오늘의 주요 뉴스를 조사해서 보고해줘" : "e.g. Research today's key news and report"} className="w-full px-3 py-1.5 text-sm" rows={2} />
                     </div>
                     <div className="flex gap-2">
                       <button
@@ -4473,7 +5082,7 @@ ${hasBash ? `
                               await updateMemberRole(workspaceId, m.id, e.target.value);
                               await refresh();
                             }}
-                            className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 bg-white focus:outline-none"
+                            className="text-[10px] px-1.5 py-0.5"
                           >
                             <option value="admin">{t("workspace.roleAdmin")}</option>
                             <option value="member">{t("workspace.roleMember")}</option>
@@ -4542,7 +5151,7 @@ ${hasBash ? `
                     <select
                       value={inviteRole}
                       onChange={(e) => setInviteRole(e.target.value as "admin" | "member")}
-                      className="px-2 py-1.5 text-xs border border-gray-300 rounded focus:outline-none"
+                      className="px-2 py-1.5 text-xs"
                     >
                       <option value="member">{t("workspace.roleMember")}</option>
                       <option value="admin">{t("workspace.roleAdmin")}</option>
@@ -4812,6 +5421,261 @@ ${hasBash ? `
                   <p className="text-xs text-[#9CA3AF] mt-1">{lang === "ko" ? "대화를 하면 자동으로 중요한 정보가 추출됩니다" : "Important info will be auto-extracted from conversations"}</p>
                 </div>
               )}
+              </>)}
+
+              {/* ── Meeting Tab ── */}
+              {settingsTab === "meeting" && (<>
+              {/* Enable toggle */}
+              <div className="p-4 bg-white rounded-lg border border-gray-200">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-sm font-medium">{t("settings.meetingEnabled")}</h3>
+                    <p className="text-xs text-gray-500 mt-0.5">{t("settings.meetingEnabledDesc")}</p>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const next = !meetingEnabled;
+                      setMeetingEnabled(next);
+                      localStorage.setItem("flaude_meeting_enabled", String(next));
+                      if (next) {
+                        // Check dependencies
+                        invoke<boolean>("check_whisper_installed").then(setWhisperInstalled);
+                        invoke<boolean>("check_ffmpeg_installed").then(setFfmpegInstalled);
+                        // system audio capture is built-in (ScreenCaptureKit/WASAPI)
+                        invoke<string>("list_whisper_models").then((r) => setWhisperModels(JSON.parse(r))).catch(() => {});
+                      }
+                    }}
+                    className={`relative w-10 h-5 rounded-full transition ${meetingEnabled ? "bg-[#1A1A1A]" : "bg-gray-300"}`}
+                  >
+                    <span className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition ${meetingEnabled ? "left-5" : "left-0.5"}`} />
+                  </button>
+                </div>
+              </div>
+
+              {meetingEnabled && (<>
+              {/* Auto-check deps on render */}
+              {whisperInstalled === null && (() => {
+                invoke<boolean>("check_whisper_installed").then(setWhisperInstalled).catch(() => setWhisperInstalled(false));
+                invoke<boolean>("check_ffmpeg_installed").then(setFfmpegInstalled).catch(() => setFfmpegInstalled(false));
+                // system audio is built-in
+                invoke<string>("list_whisper_models").then((r) => setWhisperModels(JSON.parse(r))).catch(() => {});
+                return null;
+              })()}
+
+              {/* Setup status — simple checklist */}
+              <div className="p-4 bg-white rounded-lg border border-gray-200">
+                <h3 className="text-sm font-medium mb-2">{lang === "ko" ? "준비 상태" : "Setup Status"}</h3>
+                <p className="text-xs text-gray-400 mb-3">{lang === "ko" ? "회의 녹음에 필요한 것들이에요" : "Required for meeting recording"}</p>
+                {([
+                  { name: lang === "ko" ? "음성인식 엔진 (whisper)" : "Speech Recognition (whisper)", installed: whisperInstalled, installFn: "install_whisper", checkFn: "check_whisper_installed", required: true },
+                  { name: lang === "ko" ? "오디오 변환 (ffmpeg)" : "Audio Converter (ffmpeg)", installed: ffmpegInstalled, installFn: "install_ffmpeg", checkFn: "check_ffmpeg_installed", required: true },
+                  { name: lang === "ko" ? "시스템 오디오 캡처" : "System Audio Capture", installed: true, installFn: "", checkFn: "", required: false },
+                ] as const).map((dep) => (
+                  <div key={dep.name} className="flex items-center justify-between py-2.5 border-b border-gray-50 last:border-0">
+                    <div className="flex items-center gap-2">
+                      <span className={`text-sm ${dep.installed ? "text-green-500" : dep.required ? "text-red-400" : "text-gray-300"}`}>
+                        {dep.installed ? "\u2713" : dep.required ? "\u2717" : "\u2013"}
+                      </span>
+                      <div>
+                        <span className="text-sm">{dep.name}</span>
+                        {!dep.required && <span className="text-[10px] text-gray-400 ml-1">{lang === "ko" ? "(선택)" : "(optional)"}</span>}
+                      </div>
+                    </div>
+                    {dep.installed === null ? (
+                      <span className="text-xs text-gray-300">...</span>
+                    ) : dep.installed ? (
+                      <span className="text-xs text-green-500">{lang === "ko" ? "준비됨" : "Ready"}</span>
+                    ) : (
+                      <button
+                        onClick={async () => {
+                          try {
+                            await invoke(dep.installFn);
+                            const result = await invoke<boolean>(dep.checkFn);
+                            if (dep.name.includes("whisper")) setWhisperInstalled(result);
+                            else if (dep.name.includes("ffmpeg") || dep.name.includes("오디오 변환")) setFfmpegInstalled(result);
+                            else { /* system audio built-in */ }
+                          } catch (e) {
+                            alert(`${lang === "ko" ? "설치 실패" : "Install failed"}: ${e}`);
+                          }
+                        }}
+                        className="px-3 py-1 text-xs bg-[#D97706] text-white rounded-full hover:bg-[#B45309]"
+                      >
+                        {lang === "ko" ? "자동 설치" : "Install"}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {/* Whisper Models — simplified */}
+              <div className="p-4 bg-white rounded-lg border border-gray-200">
+                <h3 className="text-sm font-medium mb-1">{lang === "ko" ? "음성 인식 모델" : "Speech Model"}</h3>
+                <p className="text-xs text-gray-400 mb-3">{lang === "ko" ? "큰 모델일수록 정확하지만 느려요. M2에서는 medium 추천!" : "Larger = more accurate but slower. Medium recommended for M2!"}</p>
+                {whisperModels.map((model) => (
+                  <div key={model.name} className="flex items-center justify-between py-2 border-b border-gray-100 last:border-0">
+                    <div>
+                      <span className="text-sm">{model.name}</span>
+                      <span className="text-xs text-gray-400 ml-2">{model.size_mb}MB</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {model.downloaded ? (
+                        <div className="flex items-center gap-2">
+                          {activeWhisperModel === model.name ? (
+                            <span className="text-xs text-green-600 font-medium">{t("settings.meetingModelActive")}</span>
+                          ) : (
+                            <button
+                              onClick={() => { setActiveWhisperModel(model.name); localStorage.setItem("flaude_meeting_model", model.name); }}
+                              className="px-2 py-0.5 text-xs text-gray-500 border rounded hover:bg-gray-50"
+                            >
+                              {lang === "ko" ? "사용" : "Use"}
+                            </button>
+                          )}
+                          <button
+                            onClick={async () => {
+                              if (!confirm(lang === "ko" ? `${model.name} 모델(${model.size_mb}MB)을 삭제할까요?` : `Delete ${model.name} (${model.size_mb}MB)?`)) return;
+                              try {
+                                await invoke("delete_whisper_model", { name: model.name });
+                                const models = JSON.parse(await invoke<string>("list_whisper_models"));
+                                setWhisperModels(models);
+                                if (activeWhisperModel === model.name) {
+                                  setActiveWhisperModel("small");
+                                  localStorage.setItem("flaude_meeting_model", "small");
+                                }
+                              } catch (e) {
+                                alert(`${lang === "ko" ? "삭제 실패" : "Delete failed"}: ${e}`);
+                              }
+                            }}
+                            className="px-1.5 py-0.5 text-xs text-gray-300 hover:text-red-500"
+                            title={lang === "ko" ? "삭제" : "Delete"}
+                          >
+                            &#10005;
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          id={`dl-${model.name}`}
+                          onClick={async () => {
+                            const btn = document.getElementById(`dl-${model.name}`) as HTMLButtonElement;
+                            btn.disabled = true;
+                            btn.textContent = lang === "ko" ? `${model.size_mb}MB 다운로드 중...` : `Downloading ${model.size_mb}MB...`;
+                            try {
+                              await invoke("download_whisper_model", { name: model.name });
+                              const models = JSON.parse(await invoke<string>("list_whisper_models"));
+                              setWhisperModels(models);
+                            } catch (e) {
+                              alert(`${lang === "ko" ? "다운로드 실패" : "Download failed"}: ${e}`);
+                              btn.disabled = false;
+                              btn.textContent = lang === "ko" ? "다운로드" : "Download";
+                            }
+                          }}
+                          className="px-2 py-0.5 text-xs bg-[#D97706] text-white rounded hover:bg-[#B45309] disabled:opacity-60"
+                        >
+                          {t("settings.meetingModelDownload")} ({model.size_mb}MB)
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Simple settings */}
+              <div className="p-4 bg-white rounded-lg border border-gray-200">
+                <h3 className="text-sm font-medium mb-3">{lang === "ko" ? "녹음 설정" : "Recording Settings"}</h3>
+                <div className="space-y-4">
+                  {/* Audio source — visual radio */}
+                  <div>
+                    <p className="text-xs text-gray-500 mb-2">{lang === "ko" ? "어떤 소리를 녹음할까요?" : "What to record?"}</p>
+                    <div className="flex gap-2">
+                      {([
+                        { value: "mic", ko: "마이크 (대면 회의)", en: "Microphone (in-person)" },
+                        { value: "system", ko: "시스템 오디오 (화상 회의)", en: "System Audio (video call)" },
+                      ] as const).map((opt) => (
+                        <button
+                          key={opt.value}
+                          onClick={() => { setMeetingAudioSource(opt.value); localStorage.setItem("flaude_meeting_source", opt.value); }}
+                          className={`flex-1 p-2.5 rounded-lg border text-xs text-center transition ${
+                            meetingAudioSource === opt.value
+                              ? "border-[#D97706] bg-[#D97706]/5 text-[#D97706] font-medium"
+                              : "border-gray-200 text-gray-500 hover:border-gray-400"
+                          }`}
+                        >
+                          {lang === "ko" ? opt.ko : opt.en}
+                        </button>
+                      ))}
+                    </div>
+                    {meetingAudioSource === "system" && (
+                      <p className="text-[10px] text-gray-400 mt-1">{lang === "ko" ? "화면 녹화 권한이 필요할 수 있습니다" : "Screen recording permission may be required"}</p>
+                    )}
+                  </div>
+
+                  {/* Language */}
+                  <div>
+                    <p className="text-xs text-gray-500 mb-2">{lang === "ko" ? "회의 언어" : "Meeting Language"}</p>
+                    <div className="flex gap-2">
+                      {([
+                        { value: "ko", label: "한국어" },
+                        { value: "en", label: "English" },
+                        { value: "ja", label: "日本語" },
+                        { value: "zh", label: "中文" },
+                      ]).map((opt) => (
+                        <button
+                          key={opt.value}
+                          onClick={() => { setMeetingLanguage(opt.value); localStorage.setItem("flaude_meeting_language", opt.value); }}
+                          className={`px-3 py-1.5 rounded-lg border text-xs transition ${
+                            meetingLanguage === opt.value
+                              ? "border-[#D97706] bg-[#D97706]/5 text-[#D97706] font-medium"
+                              : "border-gray-200 text-gray-500 hover:border-gray-400"
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Mic test */}
+                  <div className="flex items-center justify-between pt-2 border-t border-gray-100">
+                    <div>
+                      <span className="text-sm">{lang === "ko" ? "마이크 테스트" : "Mic Test"}</span>
+                      <span id="mic-test-result" className="text-xs ml-2"></span>
+                    </div>
+                    <button
+                      id="mic-test-btn"
+                      onClick={async () => {
+                        const btn = document.getElementById("mic-test-btn") as HTMLButtonElement;
+                        const result = document.getElementById("mic-test-result")!;
+                        btn.disabled = true;
+                        btn.textContent = "...";
+                        result.textContent = "";
+                        try {
+                          const testPath = `/tmp/flaude_mic_test_${Date.now()}.wav`;
+                          await invoke("start_recording", { source: "mic", path: testPath });
+                          await new Promise((r) => setTimeout(r, 2000));
+                          await invoke<string>("stop_recording");
+                          result.textContent = lang === "ko" ? "OK!" : "OK!";
+                          result.className = "text-xs ml-2 text-green-600";
+                        } catch (e) {
+                          result.textContent = `${e}`;
+                          result.className = "text-xs ml-2 text-red-500";
+                        } finally {
+                          btn.disabled = false;
+                          btn.textContent = lang === "ko" ? "테스트" : "Test";
+                        }
+                      }}
+                      className="px-3 py-1 text-xs bg-gray-100 text-gray-600 rounded hover:bg-gray-200"
+                    >
+                      {lang === "ko" ? "테스트" : "Test"}
+                    </button>
+                  </div>
+
+                  {/* Shortcut hint */}
+                  <div className="flex items-center justify-between pt-2 border-t border-gray-100">
+                    <span className="text-sm">{lang === "ko" ? "빠른 녹음 단축키" : "Quick Record Shortcut"}</span>
+                    <span className="text-xs bg-gray-100 px-2 py-1 rounded font-mono">Cmd+Shift+R</span>
+                  </div>
+                </div>
+              </div>
+              </>)}
               </>)}
             </div>
           </div>
