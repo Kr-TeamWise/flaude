@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flaude — The Agentic Workspace for Claude</title>
+  <meta name="description" content="Claude 위에서 돌아가는 에이전트 워크스페이스. 팀원을 만들고, 팀을 꾸리고, 업무를 맡기세요.">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23D97706'/><text x='16' y='23' text-anchor='middle' font-family='Georgia,serif' font-size='20' font-weight='bold' fill='white'>F</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;1,6..72,400;1,6..72,600&display=swap" rel="stylesheet">
+  <style>
+    *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+    :root{--a:#D97706;--al:#F59E0B;--ad:#92400E;--t:#18181B;--t2:#52525B;--t3:#A1A1AA;--t4:#D4D4D8;--bg:#FAFAF8;--w:#F5F0E8;--wh:#FFFFFF;--b:#E4E4E7;--bl:#F0EDE8}
+    body{font-family:'Inter',system-ui,sans-serif;color:var(--t);background:var(--bg);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+
+    /* Nav */
+    nav{position:fixed;top:0;width:100%;z-index:100;background:rgba(250,250,248,0.72);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px)}
+    .nv{max-width:1100px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;height:56px;padding:0 28px}
+    .lo{display:flex;align-items:center;gap:9px;text-decoration:none}
+    .lo-i{width:30px;height:30px;border-radius:8px;background:var(--a);display:flex;align-items:center;justify-content:center;font-family:Georgia,serif;font-size:17px;font-weight:bold;color:white;box-shadow:0 1px 3px rgba(217,119,6,0.25)}
+    .lo-t{font-size:16px;font-weight:700;color:var(--t)}
+    .nr{display:flex;align-items:center;gap:20px}
+    .nr a{font-size:13px;color:var(--t2);text-decoration:none;font-weight:500}
+    .nr a:hover{color:var(--t)}
+    .nb{background:var(--t);color:white!important;padding:7px 16px;border-radius:8px;font-size:12px!important;font-weight:600!important}
+    .nb:hover{opacity:.88}
+
+    /* Hero */
+    .hero{padding:180px 28px 48px;text-align:center;position:relative}
+    .hero::after{content:'';position:absolute;top:40px;left:50%;transform:translateX(-50%);width:800px;height:600px;background:radial-gradient(ellipse,rgba(217,119,6,0.04) 0%,transparent 65%);pointer-events:none}
+    .hp{display:inline-flex;align-items:center;gap:8px;background:linear-gradient(135deg,rgba(217,119,6,0.08),rgba(245,158,11,0.06));border:1px solid rgba(217,119,6,0.15);padding:6px 16px;border-radius:100px;font-size:12px;color:var(--a);font-weight:600;margin-bottom:32px;letter-spacing:0.01em}
+    .hero h1{font-family:'Newsreader',Georgia,serif;font-size:clamp(40px,6vw,68px);font-weight:600;line-height:1.05;max-width:750px;margin:0 auto 24px;letter-spacing:-0.03em}
+    .hero h1 em{font-style:italic;background:linear-gradient(135deg,var(--a),#F59E0B);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+    .hs{font-size:17px;line-height:1.7;color:var(--t2);max-width:440px;margin:0 auto 36px}
+    .hb{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+    .btn{display:inline-flex;align-items:center;gap:7px;padding:14px 28px;border-radius:12px;font-size:14px;font-weight:600;text-decoration:none;transition:all .2s;cursor:pointer;border:none}
+    .bd{background:var(--t);color:white;box-shadow:0 1px 3px rgba(0,0,0,0.08),0 4px 14px rgba(0,0,0,0.06)}
+    .bd:hover{box-shadow:0 2px 6px rgba(0,0,0,0.1),0 8px 28px rgba(0,0,0,0.1);transform:translateY(-1px)}
+    .hn{margin-top:14px;font-size:12px;color:var(--t3)}
+    .hn strong{color:var(--a);font-weight:600}
+
+    /* ── Full App Mockup ── */
+    .app-wrap{padding:48px 28px 0;position:relative}
+    .app-fade{position:absolute;bottom:0;left:0;right:0;height:120px;background:linear-gradient(transparent,var(--bg));z-index:2;pointer-events:none}
+    .app{max-width:1040px;margin:0 auto;background:var(--wh);border-radius:16px 16px 0 0;border:1px solid var(--b);border-bottom:none;box-shadow:0 -2px 40px rgba(0,0,0,0.06);overflow:hidden;display:flex;flex-direction:column}
+    .app-bar{display:flex;align-items:center;gap:8px;padding:13px 18px;background:linear-gradient(to bottom,#FAFAF8,#F6F5F3);border-bottom:1px solid var(--bl)}
+    .app-dot{width:12px;height:12px;border-radius:50%}
+    .app-dot:nth-child(1){background:#FF5F57}
+    .app-dot:nth-child(2){background:#FFBD2E}
+    .app-dot:nth-child(3){background:#28C840}
+    .app-bar-t{flex:1;text-align:center;font-size:12px;color:var(--t3);font-weight:500;margin-right:44px}
+    .app-body{display:flex;min-height:560px}
+
+    /* Sidebar */
+    .sb{width:180px;border-right:1px solid var(--bl);background:var(--wh);display:flex;flex-direction:column;flex-shrink:0}
+    .sb-logo{padding:14px 16px;font-family:'Newsreader',Georgia,serif;font-size:18px;font-weight:700;color:var(--a);border-bottom:1px solid var(--bl)}
+    .sb-nav{padding:8px;flex:1}
+    .sb-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:6px;font-size:13px;color:var(--t2);font-weight:500;margin-bottom:1px}
+    .sb-item.on{background:rgba(217,119,6,0.08);color:var(--a);font-weight:600}
+    .sb-item svg{width:14px;height:14px;flex-shrink:0}
+    .sb-foot{border-top:1px solid var(--bl);padding:10px 16px;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--t3)}
+    .sb-foot::before{content:'';width:6px;height:6px;border-radius:50%;background:#059669}
+
+    /* Main area — tabbed views */
+    .main{flex:1;display:flex;flex-direction:column;overflow:hidden;position:relative}
+    .views{display:flex;transition:transform .4s ease;width:500%}
+    .view{width:20%;flex-shrink:0;padding:20px;display:flex;flex-direction:column;min-height:520px}
+
+    /* View 1: Chat */
+    .v-chat-head{display:flex;align-items:center;gap:8px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--bl)}
+    .v-dot{width:26px;height:26px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:white;flex-shrink:0}
+    .v-chat-nm{font-size:14px;font-weight:600}
+    .v-chat-rl{font-size:11px;color:var(--t3)}
+    .v-chat-st{margin-left:auto;display:flex;align-items:center;gap:4px;font-size:10px;color:#059669;font-weight:600}
+    .v-chat-st::before{content:'';width:5px;height:5px;border-radius:50%;background:#059669}
+    .v-msgs{flex:1;display:flex;flex-direction:column;gap:10px}
+    .vm{max-width:80%;padding:9px 13px;border-radius:14px;font-size:12px;line-height:1.55}
+    .vm-u{align-self:flex-end;background:var(--t);color:white;border-bottom-right-radius:3px}
+    .vm-a{align-self:flex-start;background:var(--w);border-bottom-left-radius:3px}
+    .vm-a b{color:var(--ad)}
+    .v-input{margin-top:14px;padding:10px 13px;border:1px solid var(--b);border-radius:10px;font-size:12px;color:var(--t3);background:var(--bg)}
+
+    /* View 2: Members */
+    .v-members-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .vm-card{border:1px solid var(--bl);border-radius:12px;padding:16px;background:var(--bg)}
+    .vm-card-head{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+    .vm-card-nm{font-size:13px;font-weight:600}
+    .vm-card-rl{font-size:11px;color:var(--t2)}
+    .vm-card-tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:8px}
+    .vm-tag{font-size:10px;padding:2px 7px;border-radius:4px;background:var(--w);color:var(--ad);font-weight:500}
+    .vm-card-status{font-size:10px;color:#059669;font-weight:600;display:flex;align-items:center;gap:3px;margin-top:8px}
+    .vm-card-status::before{content:'';width:4px;height:4px;border-radius:50%;background:#059669}
+
+    /* View 3: Teams */
+    .vt-card{border:1px solid var(--bl);border-radius:12px;padding:16px;background:var(--bg);margin-bottom:10px}
+    .vt-card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+    .vt-card-nm{font-size:14px;font-weight:700}
+    .vt-mode{display:flex;gap:4px}
+    .vt-mode span{font-size:10px;padding:3px 8px;border-radius:5px;background:var(--bl);color:var(--t2);font-weight:500}
+    .vt-mode span.on{background:var(--t);color:white}
+    .vt-members{display:flex;flex-direction:column;gap:6px}
+    .vt-row{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;background:var(--wh)}
+    .vt-row.lead{background:rgba(217,119,6,0.06)}
+    .vt-row-nm{font-size:12px;font-weight:500;flex:1}
+    .vt-row-rl{font-size:10px;color:var(--t3)}
+    .vt-badge{font-size:9px;font-weight:700;padding:2px 6px;border-radius:4px;background:rgba(217,119,6,0.1);color:var(--a)}
+
+    /* View 4: Meeting */
+    .v-meet-card{border:1px solid var(--bl);border-radius:12px;padding:16px;background:var(--bg)}
+    .v-meet-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+    .v-meet-title{font-size:14px;font-weight:700}
+    .v-meet-rec{display:flex;align-items:center;gap:5px;font-size:11px;color:#EF4444;font-weight:600}
+    .v-meet-rec::before{content:'';width:6px;height:6px;border-radius:50%;background:#EF4444;animation:pulse 1.5s infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+    .v-wave{display:flex;align-items:center;gap:2px;height:44px;margin-bottom:12px}
+    .v-wave span{width:3px;border-radius:2px;background:var(--a);opacity:.55}
+    .v-transcript{background:var(--wh);border-radius:8px;padding:12px;font-size:11.5px;line-height:1.7;color:var(--t2);max-height:120px;overflow:hidden;position:relative}
+    .v-transcript::after{content:'';position:absolute;bottom:0;left:0;right:0;height:36px;background:linear-gradient(transparent,var(--wh))}
+    .v-transcript .ts{color:var(--t4);font-size:10px;font-weight:600;margin-right:5px}
+    .v-meet-btns{display:flex;gap:5px;margin-top:10px}
+    .v-meet-btns span{font-size:10px;padding:5px 10px;border-radius:7px;background:var(--w);color:var(--ad);font-weight:600}
+    .v-meet-meta{font-size:11px;color:var(--t3);margin-top:10px}
+
+    /* Tabs indicator */
+    .tab-dots{display:flex;justify-content:center;gap:6px;padding:16px 0 0}
+    .tab-dot{width:6px;height:6px;border-radius:50%;background:var(--t4);cursor:pointer;transition:all .2s}
+    .tab-dot.on{background:var(--a);width:20px;border-radius:3px}
+
+    /* Discord callout */
+    .discord-strip{max-width:1040px;margin:40px auto 0;padding:0 28px}
+    .ds{background:var(--wh);border:1px solid var(--bl);border-radius:14px;padding:20px 24px;display:flex;align-items:center;gap:16px}
+    .ds-icon{width:40px;height:40px;border-radius:10px;background:#5865F2;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+    .ds-body{flex:1}
+    .ds-body b{font-size:14px;display:block;margin-bottom:2px}
+    .ds-body p{font-size:12px;color:var(--t2);line-height:1.5}
+    .ds-chat{background:var(--bg);border-radius:8px;padding:10px 14px;margin-left:auto;font-size:11px;color:var(--t2);max-width:300px;flex-shrink:0}
+    .ds-chat b{color:#5865F2;font-weight:600}
+
+    /* Features */
+    .feat{padding:100px 28px 80px;max-width:1060px;margin:0 auto}
+    .feat-head{text-align:center;margin-bottom:48px}
+    .feat-head h2{font-family:'Newsreader',Georgia,serif;font-size:clamp(28px,3.5vw,40px);font-weight:600;letter-spacing:-.015em;margin-bottom:12px}
+    .feat-head p{font-size:15px;color:var(--t2);max-width:420px;margin:0 auto}
+    .fg{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+    .fc{background:var(--wh);border:1px solid var(--bl);border-radius:14px;padding:24px 22px;transition:all .2s}
+    .fc:hover{border-color:rgba(217,119,6,0.2);box-shadow:0 4px 20px rgba(217,119,6,0.05);transform:translateY(-2px)}
+    .fc-i{width:34px;height:34px;border-radius:9px;background:var(--w);display:flex;align-items:center;justify-content:center;margin-bottom:14px}
+    .fc h3{font-size:14px;font-weight:700;margin-bottom:5px}
+    .fc p{font-size:13px;color:var(--t2);line-height:1.55}
+
+    /* Integrations */
+    .integ{padding:0 28px 80px;max-width:800px;margin:0 auto;text-align:center}
+    .integ h2{font-family:'Newsreader',Georgia,serif;font-size:32px;font-weight:600;margin-bottom:12px}
+    .integ p{font-size:15px;color:var(--t2);margin-bottom:28px}
+    .ig-row{display:flex;justify-content:center;gap:10px;flex-wrap:wrap}
+    .ig-c{display:flex;align-items:center;gap:7px;padding:9px 16px;border-radius:10px;background:var(--wh);border:1px solid var(--bl);font-size:12px;font-weight:500;color:var(--t)}
+
+    /* CTA */
+    .cta{padding:0 28px 80px}
+    .cc{max-width:700px;margin:0 auto;background:var(--t);color:white;border-radius:24px;padding:60px 40px;text-align:center;position:relative;overflow:hidden}
+    .cc::before{content:'';position:absolute;top:-40%;right:-20%;width:400px;height:400px;background:radial-gradient(circle,rgba(217,119,6,0.12) 0%,transparent 70%);pointer-events:none}
+    .cc::after{content:'';position:absolute;bottom:-40%;left:-20%;width:300px;height:300px;background:radial-gradient(circle,rgba(245,158,11,0.08) 0%,transparent 70%);pointer-events:none}
+    .cc h2{font-family:'Newsreader',Georgia,serif;font-size:34px;font-weight:600;margin-bottom:10px;position:relative}
+    .cc p{font-size:15px;color:rgba(255,255,255,0.6);margin-bottom:28px;position:relative;line-height:1.6}
+    .bw{background:white;color:var(--t);box-shadow:0 2px 8px rgba(0,0,0,0.1);position:relative}
+    .bw:hover{box-shadow:0 4px 20px rgba(0,0,0,0.15);transform:translateY(-1px)}
+    .cn{margin-top:16px;font-size:12px;color:rgba(255,255,255,0.35);position:relative}
+
+    footer{padding:24px 28px;text-align:center;font-size:12px;color:var(--t3);border-top:1px solid var(--bl)}
+    footer a{color:var(--t2);text-decoration:none}
+    footer a:hover{color:var(--a)}
+
+    @media(max-width:768px){
+      .sb{display:none}
+      .fg{grid-template-columns:1fr}
+      .nr a:not(.nb){display:none}
+      .cc{padding:40px 24px}
+      .v-members-grid{grid-template-columns:1fr}
+      .ds{flex-direction:column;text-align:center}
+      .ds-chat{margin-left:0;max-width:100%}
+    }
+    @media(max-width:480px){
+      .hb{flex-direction:column;align-items:center}
+      .btn{width:100%;justify-content:center;max-width:260px}
+    }
+  </style>
+</head>
+<body>
+
+  <nav><div class="nv">
+    <a href="/" class="lo"><div class="lo-i">F</div><span class="lo-t">Flaude</span></a>
+    <div class="nr">
+      <a href="#features">Features</a>
+      <a href="https://github.com/Kr-TeamWise/flaude/releases/latest/download/Flaude_0.1.0_aarch64.dmg" class="nb">Download Free</a>
+    </div>
+  </div></nav>
+
+  <section class="hero">
+    <div class="hp">The Agentic Workspace for Claude</div>
+    <h1>당신의 AI 팀을<br><em>지금 만드세요</em></h1>
+    <p class="hs">역할을 정하고, 팀을 꾸리고, 업무를 지시하세요.<br>Claude 위에서 돌아가는 에이전트 워크스페이스.</p>
+    <div class="hb">
+      <a href="https://github.com/Kr-TeamWise/flaude/releases/latest/download/Flaude_0.1.0_aarch64.dmg" class="btn bd">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        무료 다운로드
+      </a>
+    </div>
+    <p class="hn">Claude 구독이면 <strong>무료</strong> &middot; macOS &middot; Windows coming soon</p>
+  </section>
+
+  <!-- Full App Mockup -->
+  <section class="app-wrap">
+    <div class="app">
+      <div class="app-bar">
+        <div class="app-dot"></div><div class="app-dot"></div><div class="app-dot"></div>
+        <div class="app-bar-t">Flaude</div>
+      </div>
+      <div class="app-body">
+        <!-- Sidebar -->
+        <div class="sb">
+          <div class="sb-logo">Flaude</div>
+          <div class="sb-nav">
+            <div class="sb-item on">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+              대화
+            </div>
+            <div class="sb-item">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+              팀원
+            </div>
+            <div class="sb-item">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
+              팀
+            </div>
+            <div class="sb-item">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+              고객관리
+            </div>
+            <div class="sb-item">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/></svg>
+              미팅
+            </div>
+          </div>
+          <div class="sb-foot">Connected</div>
+        </div>
+
+        <!-- Main views (scrollable via JS) -->
+        <div class="main" id="mainView">
+          <div class="views" id="views">
+
+            <!-- View 1: Chat -->
+            <div class="view">
+              <div class="v-chat-head">
+                <div class="v-dot" style="background:#3B82F6">S</div>
+                <div><div class="v-chat-nm">Sales Agent</div><div class="v-chat-rl">B2B Outreach</div></div>
+                <div class="v-chat-st">Active</div>
+              </div>
+              <div class="v-msgs">
+                <div class="vm vm-u">SaaS 시장 트렌드 조사하고, 잠재 고객 이메일 초안까지 작성해줘</div>
+                <div class="vm vm-a"><b>@Research</b>에게 시장 조사를 요청했습니다. 결과를 받으면 이메일 초안을 작성하겠습니다.</div>
+                <div class="vm vm-a" style="background:rgba(217,119,6,0.08)">
+                  <b>Research Agent</b><br>
+                  2026 SaaS 시장 핵심 트렌드 3가지:<br>
+                  1. AI-Native SaaS &mdash; 전년 대비 340% 성장<br>
+                  2. Usage-Based Pricing &mdash; 구독에서 사용량 기반으로 전환<br>
+                  3. Vertical SaaS &mdash; 산업 특화 솔루션이 2배 높은 NRR
+                </div>
+                <div class="vm vm-a">조사 결과를 반영해 이메일 초안을 작성했습니다.<br><br><b>제목:</b> AI SaaS 트렌드, 귀사의 성장 전략에 활용하세요</div>
+              </div>
+              <div class="v-input">@팀원 또는 @팀 이름으로 업무를 지시하세요...</div>
+            </div>
+
+            <!-- View 2: Members -->
+            <div class="view">
+              <div style="font-size:15px;font-weight:700;margin-bottom:14px">팀원</div>
+              <div class="v-members-grid">
+                <div class="vm-card">
+                  <div class="vm-card-head">
+                    <div class="v-dot" style="background:#3B82F6">S</div>
+                    <div><div class="vm-card-nm">Sales Agent</div><div class="vm-card-rl">B2B Outreach</div></div>
+                  </div>
+                  <div class="vm-card-tags"><span class="vm-tag">Gmail</span><span class="vm-tag">Calendar</span><span class="vm-tag">WebSearch</span></div>
+                  <div class="vm-card-status">Active</div>
+                </div>
+                <div class="vm-card">
+                  <div class="vm-card-head">
+                    <div class="v-dot" style="background:#D97706">R</div>
+                    <div><div class="vm-card-nm">Research Agent</div><div class="vm-card-rl">Market Research</div></div>
+                  </div>
+                  <div class="vm-card-tags"><span class="vm-tag">WebSearch</span><span class="vm-tag">WebFetch</span><span class="vm-tag">Write</span></div>
+                  <div class="vm-card-status">Active</div>
+                </div>
+                <div class="vm-card">
+                  <div class="vm-card-head">
+                    <div class="v-dot" style="background:#8B5CF6">A</div>
+                    <div><div class="vm-card-nm">Assistant</div><div class="vm-card-rl">Admin Support</div></div>
+                  </div>
+                  <div class="vm-card-tags"><span class="vm-tag">Calendar</span><span class="vm-tag">Drive</span><span class="vm-tag">Read</span></div>
+                  <div class="vm-card-status">Active</div>
+                </div>
+                <div class="vm-card" style="border-style:dashed;display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:13px;font-weight:500;min-height:100px">
+                  + 팀원 만들기
+                </div>
+              </div>
+            </div>
+
+            <!-- View 3: Teams -->
+            <div class="view">
+              <div style="font-size:15px;font-weight:700;margin-bottom:14px">팀</div>
+              <div class="vt-card">
+                <div class="vt-card-head">
+                  <div class="vt-card-nm">영업팀</div>
+                </div>
+                <div class="vt-members">
+                  <div class="vt-row lead">
+                    <div class="v-dot" style="background:#3B82F6;width:20px;height:20px;font-size:9px">S</div>
+                    <div class="vt-row-nm">Sales Agent</div>
+                    <div class="vt-row-rl">B2B Outreach</div>
+                    <div class="vt-badge">Lead</div>
+                  </div>
+                  <div class="vt-row">
+                    <div class="v-dot" style="background:#D97706;width:20px;height:20px;font-size:9px">R</div>
+                    <div class="vt-row-nm">Research Agent</div>
+                    <div class="vt-row-rl">Market Research</div>
+                  </div>
+                  <div class="vt-row">
+                    <div class="v-dot" style="background:#8B5CF6;width:20px;height:20px;font-size:9px">A</div>
+                    <div class="vt-row-nm">Assistant</div>
+                    <div class="vt-row-rl">Admin Support</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- View 4: Clients -->
+            <div class="view">
+              <div style="font-size:15px;font-weight:700;margin-bottom:14px">고객관리</div>
+              <div style="display:flex;flex-direction:column;gap:8px">
+                <div style="border:1px solid var(--bl);border-radius:10px;padding:14px;background:var(--bg);display:flex;align-items:center;gap:12px">
+                  <div class="v-dot" style="background:#3B82F6;width:32px;height:32px;border-radius:8px;font-size:13px">A</div>
+                  <div style="flex:1">
+                    <div style="font-size:13px;font-weight:600">Acme Corp</div>
+                    <div style="font-size:11px;color:var(--t3)">김철수 &middot; kim@acme.kr</div>
+                  </div>
+                  <div style="font-size:10px;padding:3px 8px;border-radius:5px;background:rgba(59,130,246,0.1);color:#3B82F6;font-weight:600">미팅</div>
+                </div>
+                <div style="border:1px solid var(--bl);border-radius:10px;padding:14px;background:var(--bg);display:flex;align-items:center;gap:12px">
+                  <div class="v-dot" style="background:#059669;width:32px;height:32px;border-radius:8px;font-size:13px">B</div>
+                  <div style="flex:1">
+                    <div style="font-size:13px;font-weight:600">Beta Solutions</div>
+                    <div style="font-size:11px;color:var(--t3)">이영희 &middot; lee@beta.io</div>
+                  </div>
+                  <div style="font-size:10px;padding:3px 8px;border-radius:5px;background:rgba(5,150,105,0.1);color:#059669;font-weight:600">계약</div>
+                </div>
+                <div style="border:1px solid var(--bl);border-radius:10px;padding:14px;background:var(--bg);display:flex;align-items:center;gap:12px">
+                  <div class="v-dot" style="background:#D97706;width:32px;height:32px;border-radius:8px;font-size:13px">C</div>
+                  <div style="flex:1">
+                    <div style="font-size:13px;font-weight:600">CloudPeak</div>
+                    <div style="font-size:11px;color:var(--t3)">박지훈 &middot; park@cloudpeak.co</div>
+                  </div>
+                  <div style="font-size:10px;padding:3px 8px;border-radius:5px;background:rgba(217,119,6,0.1);color:var(--a);font-weight:600">조사 중</div>
+                </div>
+                <div style="border:1px solid var(--bl);border-radius:10px;padding:14px;background:var(--bg);display:flex;align-items:center;gap:12px">
+                  <div class="v-dot" style="background:#8B5CF6;width:32px;height:32px;border-radius:8px;font-size:13px">D</div>
+                  <div style="flex:1">
+                    <div style="font-size:13px;font-weight:600">DataFlow Inc</div>
+                    <div style="font-size:11px;color:var(--t3)">최수진 &middot; choi@dataflow.dev</div>
+                  </div>
+                  <div style="font-size:10px;padding:3px 8px;border-radius:5px;background:rgba(139,92,246,0.1);color:#8B5CF6;font-weight:600">연락</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- View 5: Meeting -->
+            <div class="view">
+              <div style="font-size:15px;font-weight:700;margin-bottom:14px">미팅</div>
+              <div class="v-meet-card" style="margin-bottom:10px">
+                <div class="v-meet-head">
+                  <div class="v-meet-title">Product Roadmap Review</div>
+                  <div class="v-meet-rec">42:15</div>
+                </div>
+                <div class="v-wave">
+                  <span style="height:12px"></span><span style="height:28px"></span><span style="height:20px"></span><span style="height:36px"></span><span style="height:16px"></span><span style="height:40px"></span><span style="height:24px"></span><span style="height:32px"></span><span style="height:14px"></span><span style="height:38px"></span><span style="height:22px"></span><span style="height:30px"></span><span style="height:18px"></span><span style="height:42px"></span><span style="height:26px"></span><span style="height:34px"></span><span style="height:10px"></span><span style="height:36px"></span><span style="height:20px"></span><span style="height:28px"></span><span style="height:44px"></span><span style="height:16px"></span><span style="height:38px"></span><span style="height:24px"></span><span style="height:12px"></span><span style="height:32px"></span><span style="height:18px"></span><span style="height:40px"></span><span style="height:22px"></span><span style="height:14px"></span><span style="height:30px"></span><span style="height:36px"></span><span style="height:20px"></span><span style="height:26px"></span><span style="height:42px"></span><span style="height:16px"></span><span style="height:34px"></span><span style="height:12px"></span><span style="height:28px"></span><span style="height:38px"></span>
+                </div>
+                <div class="v-meet-meta">2026.03.18 &middot; 참석자 4명 &middot; Whisper medium &middot; 한국어</div>
+              </div>
+              <div style="font-size:12px;font-weight:700;color:var(--t2);margin-bottom:8px">전사 결과</div>
+              <div class="v-transcript" style="max-height:140px">
+                <span class="ts">00:12</span>오늘 Q2 로드맵 논의를 시작하겠습니다.<br>
+                <span class="ts">01:45</span>현재 가장 요청이 많은 기능은 자동 팔로업입니다.<br>
+                <span class="ts">03:20</span>기술적으로는 2주 안에 가능할 것 같습니다.<br>
+                <span class="ts">05:10</span>그러면 다음 스프린트에 포함시키죠.<br>
+                <span class="ts">07:30</span>디자인 리뷰는 수요일까지 마무리합시다.
+              </div>
+              <div style="font-size:12px;font-weight:700;color:var(--t2);margin:12px 0 8px">에이전트에게 맡기기</div>
+              <div class="v-meet-btns"><span>AI 요약</span><span>액션 아이템</span><span>팔로업 이메일</span><span>제안서 초안</span></div>
+            </div>
+
+          </div>
+          <div class="tab-dots" id="tabDots">
+            <div class="tab-dot on" data-i="0"></div>
+            <div class="tab-dot" data-i="1"></div>
+            <div class="tab-dot" data-i="2"></div>
+            <div class="tab-dot" data-i="3"></div>
+            <div class="tab-dot" data-i="4"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="app-fade"></div>
+  </section>
+
+  <!-- Discord callout -->
+  <section class="discord-strip">
+    <div class="ds">
+      <div class="ds-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M20.317 4.37a19.791 19.791 0 00-4.885-1.515.074.074 0 00-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 00-5.487 0 12.64 12.64 0 00-.617-1.25.077.077 0 00-.079-.037A19.736 19.736 0 003.677 4.37a.07.07 0 00-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 00.031.057 19.9 19.9 0 005.993 3.03.078.078 0 00.084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 00-.041-.106 13.107 13.107 0 01-1.872-.892.077.077 0 01-.008-.128 10.2 10.2 0 00.372-.292.074.074 0 01.077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 01.078.01c.12.098.246.198.373.292a.077.077 0 01-.006.127 12.299 12.299 0 01-1.873.892.077.077 0 00-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 00.084.028 19.839 19.839 0 006.002-3.03.077.077 0 00.032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 00-.031-.03z"/></svg></div>
+      <div class="ds-body">
+        <b>Discord / Slack에서도 바로 호출</b>
+        <p>팀 채팅방에서 에이전트를 멘션하면 대답합니다. 앱을 열 필요 없이.</p>
+      </div>
+      <div class="ds-chat">
+        <b>@Flaude</b> 다음 주 미팅 일정 정리해줘<br><br>
+        <span style="color:var(--a)">Flaude</span> 다음 주 미팅 3건을 정리했습니다...
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section class="feat" id="features">
+    <div class="feat-head">
+      <h2>역할을 정하고, 업무를 맡기세요</h2>
+      <p>에이전트마다 다른 역할과 도구를 부여하고 팀으로 묶어 운영합니다.</p>
+    </div>
+    <div class="fg">
+      <div class="fc"><div class="fc-i"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#D97706" stroke-width="2" stroke-linecap="round"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg></div><h3>팀원 고용</h3><p>이름, 역할, 업무 매뉴얼, 사용 도구를 지정해서 나만의 AI 팀원을 만드세요.</p></div>
+      <div class="fc"><div class="fc-i"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#D97706" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div><h3>웹 조사</h3><p>웹 검색, 경쟁사 분석, 보고서 작성까지. 물어보면 알아서 찾아옵니다.</p></div>
+      <div class="fc"><div class="fc-i"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#D97706" stroke-width="2" stroke-linecap="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div><h3>이메일 + 캘린더</h3><p>Gmail에서 이메일 보내고, Calendar에 미팅 잡고, 팔로업까지. Google Workspace 직접 연동.</p></div>
+      <div class="fc"><div class="fc-i"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#D97706" stroke-width="2" stroke-linecap="round"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg></div><h3>회의 녹음 + AI 요약</h3><p>녹음하고, Whisper로 전사하고, AI가 요약과 액션 아이템을 정리합니다.</p></div>
+      <div class="fc"><div class="fc-i"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#D97706" stroke-width="2" stroke-linecap="round"><path d="M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z"/></svg></div><h3>팀 채팅 연동</h3><p>Discord, Slack에서 에이전트를 호출하세요. 앱을 열지 않아도 됩니다.</p></div>
+      <div class="fc"><div class="fc-i"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#D97706" stroke-width="2" stroke-linecap="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg></div><h3>로컬 우선</h3><p>대화와 설정은 내 Mac에 저장. 서버에는 팀 협업 데이터만 암호화 보관.</p></div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="cta">
+    <div class="cc">
+      <h2>3분이면 팀이 완성됩니다</h2>
+      <p>앱 설치하고 Google 로그인하면 끝.<br>AI 팀원이 바로 일을 시작합니다.</p>
+      <a href="https://github.com/Kr-TeamWise/flaude/releases/latest/download/Flaude_0.1.0_aarch64.dmg" class="btn bw">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        무료 다운로드
+      </a>
+      <p class="cn">Claude 구독 필요 &middot; macOS &middot; Windows coming soon</p>
+    </div>
+  </section>
+
+  <footer><p>&copy; 2026 <a href="https://conscience.technology">Conscience Technology</a> &middot; Powered by <a href="https://claude.ai">Claude</a></p></footer>
+
+  <script>
+    // Tab switcher for app mockup
+    const views = document.getElementById('views');
+    const dots = document.querySelectorAll('.tab-dot');
+    const sbItems = document.querySelectorAll('.sb-item');
+    let current = 0;
+
+    function goTo(i) {
+      current = i;
+      views.style.transform = `translateX(-${i * 20}%)`;
+      dots.forEach((d, j) => d.classList.toggle('on', j === i));
+      sbItems.forEach((s, j) => s.classList.toggle('on', j === i));
+    }
+
+    dots.forEach(d => d.addEventListener('click', () => goTo(+d.dataset.i)));
+    sbItems.forEach((s, i) => s.addEventListener('click', () => goTo(i)));
+
+    // Auto-rotate every 4s
+    setInterval(() => goTo((current + 1) % 5), 4000);
+  </script>
+
+</body>
+</html>
