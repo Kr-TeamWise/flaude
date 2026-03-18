@@ -33,6 +33,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": ["resources/gws_client_secret.json"],
     "createUpdaterArtifacts": true,
     "macOS": {
       "entitlements": null

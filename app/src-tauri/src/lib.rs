@@ -25,14 +25,19 @@ const KNOWN_INTEGRATIONS: &[&str] = &[
     "gws", "github", "discord", "slack", "sentry", "linear", "notion", "figma",
 ];
 
-/// Run a shell command via zsh and return stdout
+/// Run a shell command and return stdout (cross-platform)
 fn shell(script: &str) -> Result<String, String> {
-    let output = Command::new("zsh")
-        .arg("-l")
-        .arg("-c")
-        .arg(script)
-        .output()
-        .map_err(|e| format!("shell error: {}", e))?;
+    let output = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .args(["/C", script])
+            .output()
+    } else {
+        Command::new("zsh")
+            .arg("-l")
+            .arg("-c")
+            .arg(script)
+            .output()
+    }.map_err(|e| format!("shell error: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
@@ -42,6 +47,35 @@ fn shell(script: &str) -> Result<String, String> {
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Open a URL in the default browser (cross-platform)
+fn open_url(url: &str) -> Result<(), String> {
+    if cfg!(target_os = "windows") {
+        Command::new("cmd").args(["/C", "start", "", url]).spawn()
+    } else {
+        Command::new("open").arg(url).spawn()
+    }.map_err(|e| format!("open_url error: {}", e))?;
+    Ok(())
+}
+
+/// Spawn a background shell command (cross-platform, non-blocking)
+fn shell_spawn(script: &str) -> Result<std::process::Child, String> {
+    if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .args(["/C", script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    } else {
+        Command::new("zsh")
+            .arg("-l")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    }.map_err(|e| format!("shell_spawn error: {}", e))
 }
 
 /// Resolve the path to agent-runner.ts relative to the binary.
@@ -766,7 +800,7 @@ async fn check_integration(id: String) -> Result<String, String> {
                 Ok(v) if !v.is_empty() => {
                     let ver = v.lines().next().unwrap_or(&v);
                     match shell("gws auth status 2>/dev/null") {
-                        Ok(s) if s.contains("logged in") || s.contains("authenticated") => {
+                        Ok(s) if s.contains("token_valid") && s.contains("true") => {
                             Ok(format!("connected:{}", ver))
                         }
                         _ => Ok(format!("needs_auth:{}", ver)),
@@ -787,7 +821,33 @@ async fn auth_integration(id: String) -> Result<String, String> {
 
     match id.as_str() {
         "gws" => {
-            shell("gws auth login &")?;
+            // Spawn gws auth login, redirect output to temp file, poll for URL
+            std::thread::spawn(|| {
+                let tmpfile = if cfg!(target_os = "windows") {
+                    std::env::temp_dir().join("flaude_gws_auth.log")
+                } else {
+                    std::path::PathBuf::from("/tmp/flaude_gws_auth.log")
+                };
+                let _ = std::fs::remove_file(&tmpfile);
+                let cmd = format!(
+                    "gws auth login -s drive,spreadsheets,gmail,calendar,documents,presentations,tasks,pubsub,cloud-platform > \"{}\" 2>&1",
+                    tmpfile.display()
+                );
+                let _ = shell_spawn(&cmd);
+                // Poll the file for the Google OAuth URL
+                for _ in 0..30 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if let Ok(content) = std::fs::read_to_string(&tmpfile) {
+                        if let Some(start) = content.find("https://accounts.google.com") {
+                            if let Some(end) = content[start..].find(|c: char| c.is_whitespace()) {
+                                let url = &content[start..start + end];
+                                let _ = open_url(url);
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
             Ok("Browser opened for Google authentication.".into())
         }
         name => {
@@ -883,9 +943,16 @@ async fn setup_all_integrations() -> Result<String, String> {
 
 #[tauri::command]
 async fn check_claude_installed() -> Result<bool, String> {
-    match shell("which claude 2>/dev/null || ls /usr/local/bin/claude 2>/dev/null || ls /Applications/cmux.app/Contents/Resources/bin/claude 2>/dev/null || ls \"$HOME/.claude/local/claude\" 2>/dev/null") {
-        Ok(path) => Ok(!path.is_empty()),
-        Err(_) => Ok(false),
+    if cfg!(target_os = "windows") {
+        match shell("where claude 2>nul") {
+            Ok(path) => Ok(!path.is_empty()),
+            Err(_) => Ok(false),
+        }
+    } else {
+        match shell("test -x /Applications/cmux.app/Contents/Resources/bin/claude && echo found || which claude 2>/dev/null || test -x /usr/local/bin/claude && echo found || test -x \"$HOME/.claude/local/claude\" && echo found || test -x \"$HOME/.nvm/versions/node/*/bin/claude\" && echo found") {
+            Ok(path) => Ok(!path.is_empty()),
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -901,6 +968,31 @@ async fn check_claude_auth() -> Result<bool, String> {
 async fn install_claude() -> Result<String, String> {
     shell("npm install -g @anthropic-ai/claude-code")?;
     Ok("Claude Code installed successfully.".into())
+}
+
+#[tauri::command]
+async fn login_claude() -> Result<String, String> {
+    // Spawn claude /login in background — it opens the browser for auth
+    std::thread::spawn(|| {
+        let tmpfile = if cfg!(target_os = "windows") {
+            std::env::temp_dir().join("flaude_claude_login.log")
+        } else {
+            std::path::PathBuf::from("/tmp/flaude_claude_login.log")
+        };
+        let _ = std::fs::remove_file(&tmpfile);
+        let redirect = if cfg!(target_os = "windows") {
+            format!("claude /login > \"{}\" 2>&1", tmpfile.display())
+        } else {
+            format!("claude /login > \"{}\" 2>&1", tmpfile.display())
+        };
+        let _ = shell_spawn(&redirect);
+    });
+    Ok("Browser opened for Claude login.".into())
+}
+
+#[tauri::command]
+async fn shell_command(script: String) -> Result<String, String> {
+    shell(&script)
 }
 
 // ── Meeting: Dependency checks ──────────────────────
@@ -1545,6 +1637,24 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             use tauri_plugin_global_shortcut::ShortcutState;
+
+            // Auto-provision GWS client_secret.json if missing
+            {
+                use tauri::Manager;
+                let home = std::env::var("HOME").unwrap_or_default();
+                let gws_dir = std::path::PathBuf::from(&home).join(".config/gws");
+                let gws_secret = gws_dir.join("client_secret.json");
+                if !gws_secret.exists() {
+                    if let Ok(resource_dir) = app.path().resource_dir() {
+                        let bundled = resource_dir.join("resources/gws_client_secret.json");
+                        if bundled.exists() {
+                            let _ = std::fs::create_dir_all(&gws_dir);
+                            let _ = std::fs::copy(&bundled, &gws_secret);
+                        }
+                    }
+                }
+            }
+
             let handle = app.handle().clone();
             app.global_shortcut().on_shortcut("CmdOrCtrl+Shift+R", move |_app, _shortcut, event| {
                 if event.state == ShortcutState::Pressed {
@@ -1571,6 +1681,8 @@ pub fn run() {
             check_claude_installed,
             check_claude_auth,
             install_claude,
+            login_claude,
+            shell_command,
             save_chat_file,
             read_data,
             write_data,

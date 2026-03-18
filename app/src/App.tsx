@@ -937,8 +937,8 @@ ${agentName}: ${agentResponse.slice(0, 2000)}`;
   // Setup wizard
   const [setupDone, setSetupDone] = useState(() => localStorage.getItem("flaude_setup_done") === "true");
   const [wizardStep, setWizardStep] = useState(0);
-  const [claudeStatus, setClaudeStatus] = useState<"checking" | "ok" | "missing">("checking");
-  const [gwsStatus, setGwsStatus] = useState<"checking" | "ok" | "missing">("checking");
+  const [claudeStatus, setClaudeStatus] = useState<"checking" | "ok" | "missing" | "installing" | "install_failed" | "need_login" | "logging_in">("checking");
+  const [gwsStatus, setGwsStatus] = useState<"checking" | "ok" | "missing" | "installing" | "install_failed" | "needs_auth" | "authing">("checking");
 
   // Avatar helper — notionists style with warm pastel backgrounds
   const AVATAR_BG = ["F9C4AC","B8E0D2","D4C5F9","F9E2AE","A8D8EA","F5B7B1","C3E8BD","E8D5B7"];
@@ -2188,29 +2188,90 @@ ${hasBash ? `
       // Step 1: Claude Code check
       () => {
         if (claudeStatus === "checking") {
-          invoke<string>("run_agent", {
-            prompt: "echo ok",
-            instructions: "Reply with just 'ok'",
-            allowedTools: "",
-            disallowedTools: null,
-            sessionId: null,
-            enableCheckpointing: false,
-            cwd: null,
-          }).then(() => setClaudeStatus("ok")).catch(() => setClaudeStatus("missing"));
+          invoke<boolean>("check_claude_installed").then((installed) => {
+            if (installed) {
+              // Installed, now verify it actually works (login check)
+              invoke<string>("run_agent", {
+                prompt: "echo ok",
+                instructions: "Reply with just 'ok'",
+                allowedTools: "",
+                disallowedTools: null,
+                sessionId: null,
+                enableCheckpointing: false,
+                cwd: null,
+              }).then(() => setClaudeStatus("ok")).catch(() => setClaudeStatus("need_login"));
+            } else {
+              setClaudeStatus("missing");
+            }
+          }).catch(() => setClaudeStatus("missing"));
         }
+        const handleInstall = () => {
+          setClaudeStatus("installing");
+          invoke<string>("install_claude")
+            .then(() => setClaudeStatus("need_login"))
+            .catch(() => setClaudeStatus("install_failed"));
+        };
+        const handleLogin = () => {
+          setClaudeStatus("logging_in");
+          invoke<string>("login_claude")
+            .then(() => {
+              // Poll for login completion (browser auth takes time)
+              const poll = setInterval(() => {
+                invoke<string>("run_agent", {
+                  prompt: "echo ok",
+                  instructions: "Reply with just 'ok'",
+                  allowedTools: "",
+                  disallowedTools: null,
+                  sessionId: null,
+                  enableCheckpointing: false,
+                  cwd: null,
+                }).then(() => { clearInterval(poll); setClaudeStatus("ok"); }).catch(() => {});
+              }, 3000);
+              // Stop polling after 2 minutes
+              setTimeout(() => { clearInterval(poll); if (claudeStatus === "logging_in") setClaudeStatus("need_login"); }, 120000);
+            })
+            .catch(() => setClaudeStatus("need_login"));
+        };
+        const statusColor = claudeStatus === "ok" ? "border-[#059669]/40 bg-[#059669]/5 text-[#059669]"
+          : (claudeStatus === "missing" || claudeStatus === "install_failed") ? "border-red-300 bg-red-50 text-red-600"
+          : claudeStatus === "need_login" ? "border-amber-300 bg-amber-50 text-amber-700"
+          : "border-gray-200 bg-gray-50 text-[#6B7280] animate-pulse";
+        const statusText = claudeStatus === "checking" ? t("wizard.claudeChecking")
+          : claudeStatus === "ok" ? t("wizard.claudeOk")
+          : claudeStatus === "missing" ? t("wizard.claudeNotFound")
+          : claudeStatus === "installing" ? (lang === "ko" ? "설치 중..." : "Installing...")
+          : claudeStatus === "install_failed" ? (lang === "ko" ? "설치 실패" : "Installation failed")
+          : claudeStatus === "need_login" ? (lang === "ko" ? "로그인이 필요합니다" : "Login required")
+          : (lang === "ko" ? "로그인 중..." : "Logging in...");
         return (
           <div>
             <h2 className="text-lg font-serif font-bold mb-2">{t("wizard.claudeTitle")}</h2>
             <p className="text-sm text-[#6B7280] whitespace-pre-line mb-4">{t("wizard.claudeDesc")}</p>
-            <div className={`p-3 rounded-lg border text-sm ${
-              claudeStatus === "ok" ? "border-[#059669]/40 bg-[#059669]/5 text-[#059669]"
-              : claudeStatus === "missing" ? "border-red-300 bg-red-50 text-red-600"
-              : "border-gray-200 bg-gray-50 text-[#6B7280] animate-pulse"
-            }`}>
-              {claudeStatus === "checking" && t("wizard.claudeChecking")}
-              {claudeStatus === "ok" && t("wizard.claudeOk")}
-              {claudeStatus === "missing" && t("wizard.claudeNotFound")}
+            <div className={`p-3 rounded-lg border text-sm ${statusColor}`}>
+              {statusText}
             </div>
+            {claudeStatus === "missing" && (
+              <button onClick={handleInstall} className="mt-3 w-full py-2 px-4 rounded-lg bg-[#D97706] text-white text-sm font-medium hover:bg-[#B45309] transition-colors">
+                {lang === "ko" ? "Claude Code 설치" : "Install Claude Code"}
+              </button>
+            )}
+            {claudeStatus === "install_failed" && (
+              <div className="mt-3 space-y-2">
+                <p className="text-xs text-[#6B7280]">{lang === "ko" ? "터미널에서 직접 설치해주세요:" : "Install manually in terminal:"}</p>
+                <code className="block text-xs bg-gray-100 p-2 rounded">npm install -g @anthropic-ai/claude-code</code>
+                <button onClick={() => setClaudeStatus("checking")} className="w-full py-2 px-4 rounded-lg border border-gray-200 text-sm hover:bg-gray-50 transition-colors">
+                  {lang === "ko" ? "다시 확인" : "Re-check"}
+                </button>
+              </div>
+            )}
+            {claudeStatus === "need_login" && (
+              <div className="mt-3 space-y-2">
+                <p className="text-xs text-[#6B7280]">{lang === "ko" ? "Claude Code가 설치되었지만 로그인이 필요합니다." : "Claude Code is installed but needs login."}</p>
+                <button onClick={handleLogin} className="w-full py-2 px-4 rounded-lg bg-[#D97706] text-white text-sm font-medium hover:bg-[#B45309] transition-colors">
+                  {lang === "ko" ? "로그인" : "Log in"}
+                </button>
+              </div>
+            )}
           </div>
         );
       },
@@ -2218,31 +2279,83 @@ ${hasBash ? `
       () => {
         if (gwsStatus === "checking") {
           invoke<string>("check_integration", { id: "gws" })
-            .then((s) => setGwsStatus(s.startsWith("connected") ? "ok" : "missing"))
+            .then((s) => {
+              if (s.startsWith("connected")) setGwsStatus("ok");
+              else if (s.startsWith("needs_auth")) setGwsStatus("needs_auth");
+              else setGwsStatus("missing");
+            })
             .catch(() => setGwsStatus("missing"));
         }
+        const handleGwsInstall = async () => {
+          setGwsStatus("installing");
+          try {
+            await invoke<string>("setup_integration", { id: "gws", envVars: null });
+            setGwsStatus("needs_auth");
+          } catch (e) {
+            console.error("GWS install failed:", e);
+            setGwsStatus("install_failed");
+          }
+        };
+        const handleGwsAuth = async () => {
+          setGwsStatus("authing");
+          try {
+            await invoke<string>("auth_integration", { id: "gws" });
+            // Poll for auth completion
+            const poll = setInterval(async () => {
+              try {
+                const s = await invoke<string>("check_integration", { id: "gws" });
+                if (s.startsWith("connected")) {
+                  clearInterval(poll);
+                  setGwsStatus("ok");
+                }
+              } catch (_) {}
+            }, 3000);
+            // Stop polling after 2 minutes
+            setTimeout(() => { clearInterval(poll); }, 120000);
+          } catch (e) {
+            console.error("GWS auth failed:", e);
+            setGwsStatus("needs_auth");
+          }
+        };
+        const gwsColor = gwsStatus === "ok" ? "border-[#059669]/40 bg-[#059669]/5 text-[#059669]"
+          : (gwsStatus === "missing" || gwsStatus === "install_failed") ? "border-gray-200 bg-gray-50 text-[#6B7280]"
+          : gwsStatus === "needs_auth" ? "border-amber-300 bg-amber-50 text-amber-700"
+          : "border-gray-200 bg-gray-50 text-[#6B7280] animate-pulse";
+        const gwsText = gwsStatus === "checking" ? t("wizard.claudeChecking")
+          : gwsStatus === "ok" ? "Google Workspace " + t("settings.connected")
+          : gwsStatus === "missing" ? t("common.notInstalled")
+          : gwsStatus === "installing" ? (lang === "ko" ? "설치 중..." : "Installing...")
+          : gwsStatus === "install_failed" ? (lang === "ko" ? "설치 실패" : "Installation failed")
+          : gwsStatus === "needs_auth" ? (lang === "ko" ? "로그인이 필요합니다" : "Login required")
+          : (lang === "ko" ? "인증 중..." : "Authenticating...");
         return (
           <div>
             <h2 className="text-lg font-serif font-bold mb-2">{t("wizard.gwsTitle")}</h2>
             <p className="text-sm text-[#6B7280] mb-4">{t("wizard.gwsDesc")}</p>
-            <div className={`p-3 rounded-lg border text-sm mb-3 ${
-              gwsStatus === "ok" ? "border-[#059669]/40 bg-[#059669]/5 text-[#059669]" : "border-gray-200 bg-gray-50 text-[#6B7280]"
-            }`}>
-              {gwsStatus === "checking" ? t("wizard.claudeChecking") : gwsStatus === "ok" ? "Google Workspace " + t("settings.connected") : t("common.notInstalled")}
+            <div className={`p-3 rounded-lg border text-sm mb-3 ${gwsColor}`}>
+              {gwsText}
             </div>
-            {gwsStatus !== "ok" && (
-              <button
-                onClick={async () => {
-                  try {
-                    await invoke<string>("setup_integration", { id: "gws", envVars: null });
-                    await invoke<string>("auth_integration", { id: "gws" });
-                    setGwsStatus("ok");
-                  } catch (e) { console.error("GWS setup failed:", e); }
-                }}
-                className="px-4 py-2 text-sm bg-[#D97706] text-white rounded-lg hover:bg-[#B45309]"
-              >
-                {t("settings.install")}
+            {gwsStatus === "missing" && (
+              <button onClick={handleGwsInstall} className="w-full py-2 px-4 text-sm bg-[#D97706] text-white rounded-lg hover:bg-[#B45309] transition-colors">
+                {lang === "ko" ? "GWS CLI 설치" : "Install GWS CLI"}
               </button>
+            )}
+            {gwsStatus === "install_failed" && (
+              <div className="mt-2 space-y-2">
+                <p className="text-xs text-[#6B7280]">{lang === "ko" ? "터미널에서 직접 설치해주세요:" : "Install manually in terminal:"}</p>
+                <code className="block text-xs bg-gray-100 p-2 rounded">npm install -g @anthropic-ai/googleworkspace-tools</code>
+                <button onClick={() => setGwsStatus("checking")} className="w-full py-2 px-4 rounded-lg border border-gray-200 text-sm hover:bg-gray-50 transition-colors">
+                  {lang === "ko" ? "다시 확인" : "Re-check"}
+                </button>
+              </div>
+            )}
+            {gwsStatus === "needs_auth" && (
+              <div className="space-y-2">
+                <p className="text-xs text-[#6B7280]">{lang === "ko" ? "GWS CLI가 설치되었습니다. Google 계정 인증이 필요합니다." : "GWS CLI installed. Google account authentication needed."}</p>
+                <button onClick={handleGwsAuth} className="w-full py-2 px-4 text-sm bg-[#D97706] text-white rounded-lg hover:bg-[#B45309] transition-colors">
+                  {lang === "ko" ? "Google 인증" : "Authenticate Google"}
+                </button>
+              </div>
             )}
           </div>
         );
