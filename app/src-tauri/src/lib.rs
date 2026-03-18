@@ -868,9 +868,8 @@ end tell'"#,
 async fn setup_integration(id: String, _env_vars: Option<String>) -> Result<String, String> {
     match id.as_str() {
         "gws" => {
-            shell("npm install -g @googleworkspace/cli")?;
-            shell("gws auth setup 2>/dev/null || true")?;
-            Ok("gws CLI installed. Run 'gws auth login' in terminal to complete authentication.".into())
+            shell("npm install -g @googleworkspace/cli 2>&1")?;
+            Ok("gws CLI installed.".into())
         }
         "github" => {
             shell("claude mcp add --transport http github https://api.githubcopilot.com/mcp/ 2>/dev/null || true")?;
@@ -972,21 +971,8 @@ async fn install_claude() -> Result<String, String> {
 
 #[tauri::command]
 async fn login_claude() -> Result<String, String> {
-    // Spawn claude /login in background — it opens the browser for auth
-    std::thread::spawn(|| {
-        let tmpfile = if cfg!(target_os = "windows") {
-            std::env::temp_dir().join("flaude_claude_login.log")
-        } else {
-            std::path::PathBuf::from("/tmp/flaude_claude_login.log")
-        };
-        let _ = std::fs::remove_file(&tmpfile);
-        let redirect = if cfg!(target_os = "windows") {
-            format!("claude /login > \"{}\" 2>&1", tmpfile.display())
-        } else {
-            format!("claude /login > \"{}\" 2>&1", tmpfile.display())
-        };
-        let _ = shell_spawn(&redirect);
-    });
+    // claude auth login opens browser automatically
+    let _ = shell_spawn("claude auth login");
     Ok("Browser opened for Claude login.".into())
 }
 
