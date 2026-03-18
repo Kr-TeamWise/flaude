@@ -61,6 +61,7 @@ import {
   authGooglePoll,
   setAuthToken,
   getAuthToken,
+  getMe,
   SERVER_URL,
   type Meeting,
   type MeetingTranscript as MeetingTranscriptType,
