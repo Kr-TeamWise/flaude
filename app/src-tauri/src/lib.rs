@@ -80,14 +80,24 @@ fn shell_spawn(script: &str) -> Result<std::process::Child, String> {
 
 /// Resolve the path to agent-runner.ts relative to the binary.
 fn runner_script_path() -> String {
-    // In dev, look relative to src-tauri; in production, look relative to the binary
+    // In dev, look relative to src-tauri
     let dev_path = concat!(env!("CARGO_MANIFEST_DIR"), "/sdk-runner/agent-runner.ts");
     if std::path::Path::new(dev_path).exists() {
         return dev_path.to_string();
     }
-    // Fallback: assume sdk-runner is next to the binary
+    // Production: look in Resources dir (macOS .app bundle)
     if let Ok(exe) = std::env::current_exe() {
+        // macOS: Flaude.app/Contents/MacOS/flaude → Flaude.app/Contents/Resources/
         if let Some(dir) = exe.parent() {
+            // Check Resources dir (Tauri bundles resources here)
+            let resources = dir.parent().map(|d| d.join("Resources"));
+            if let Some(ref res_dir) = resources {
+                let p = res_dir.join("sdk-runner/agent-runner.ts");
+                if p.exists() {
+                    return p.to_string_lossy().to_string();
+                }
+            }
+            // Fallback: next to binary
             let p = dir.join("sdk-runner/agent-runner.ts");
             if p.exists() {
                 return p.to_string_lossy().to_string();
@@ -1637,6 +1647,20 @@ pub fn run() {
                             let _ = std::fs::create_dir_all(&gws_dir);
                             let _ = std::fs::copy(&bundled, &gws_secret);
                         }
+                    }
+                }
+            }
+
+            // Auto-install sdk-runner dependencies if needed
+            {
+                let script_path = runner_script_path();
+                if let Some(runner_dir) = std::path::Path::new(&script_path).parent() {
+                    let node_modules = runner_dir.join("node_modules");
+                    if !node_modules.exists() && runner_dir.join("package.json").exists() {
+                        let dir_str = runner_dir.to_string_lossy().to_string();
+                        std::thread::spawn(move || {
+                            let _ = shell(&format!("cd '{}' && npm install", dir_str));
+                        });
                     }
                 }
             }

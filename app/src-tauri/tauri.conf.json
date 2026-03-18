@@ -33,7 +33,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["resources/gws_client_secret.json"],
+    "resources": ["resources/gws_client_secret.json", "sdk-runner/agent-runner.ts", "sdk-runner/package.json", "sdk-runner/package-lock.json"],
     "createUpdaterArtifacts": true,
     "macOS": {
       "entitlements": null
