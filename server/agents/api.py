@@ -182,12 +182,71 @@ def _create_or_get_user_token(email: str, name: str) -> dict:
         defaults={"token": secrets.token_urlsafe(48)},
     )
 
-    # Auto-create a workspace + owner membership if user has none
+    # Auto-create a workspace + owner membership + default agents/team if user has none
     if not WorkspaceMembership.objects.filter(user=user).exists():
         ws = Workspace.objects.create(name="My Workspace", created_by=user)
         WorkspaceMembership.objects.create(workspace=ws, user=user, role="owner")
+        _setup_default_agents(ws, user)
 
     return {"token": token_obj.token, "email": email, "name": name}
+
+
+def _setup_default_agents(ws, user):
+    """Create default agents and team for a new workspace."""
+    default_agents = [
+        {
+            "name": "Ria",
+            "role": "Market Research",
+            "instructions": (
+                "당신은 시장 조사 전문 에이전트입니다. 웹에서 최신 시장·산업·경쟁사 자료를 수집하고, "
+                "교차 검증하여 체계적인 보고서를 작성합니다."
+            ),
+            "tools": ["WebSearch", "WebFetch", "Bash", "Read", "Write"],
+            "is_lead": False,
+        },
+        {
+            "name": "Kade",
+            "role": "Sales Outreach",
+            "instructions": (
+                "당신은 B2B 영업 전문 에이전트입니다. 잠재 고객에게 개인화된 이메일을 보내고, "
+                "미팅을 잡고, 팔로업을 관리합니다."
+            ),
+            "tools": ["Bash", "Read", "Write"],
+            "is_lead": True,
+        },
+        {
+            "name": "Noa",
+            "role": "Assistant",
+            "instructions": (
+                "당신은 비즈니스 어시스턴트 에이전트입니다. 일정 관리, 회의록 정리, "
+                "문서 관리 등 팀의 생산성을 높이는 업무를 수행합니다."
+            ),
+            "tools": ["Bash", "Read", "Write"],
+            "is_lead": False,
+        },
+    ]
+
+    created = []
+    for spec in default_agents:
+        agent = Agent.objects.create(
+            workspace=ws,
+            name=spec["name"],
+            role=spec["role"],
+            instructions=spec["instructions"],
+            tools=spec["tools"],
+            not_allowed=[],
+            created_by=user,
+        )
+        created.append({"agent": agent, "is_lead": spec["is_lead"]})
+
+    AgentTeam.objects.create(
+        workspace=ws,
+        name="영업팀",
+        members=[
+            {"agent_id": c["agent"].id, "order": i + 1, "is_lead": c["is_lead"]}
+            for i, c in enumerate(created)
+        ],
+    )
 
 
 # ── Me ──────────────────────────────────────────────────────────
