@@ -78,10 +78,13 @@ class Agent(models.Model):
 
 class AgentTeam(models.Model):
     workspace = models.ForeignKey(Workspace, on_delete=models.CASCADE, related_name="agent_teams")
-    name = models.CharField(max_length=100, unique=True)
+    name = models.CharField(max_length=100)
     members = models.JSONField(default=list)
     execution_mode = models.CharField(max_length=20, default="sequential", choices=[("sequential", "Sequential"), ("parallel", "Parallel")])
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [("workspace", "name")]
 
     def __str__(self):
         return self.name
