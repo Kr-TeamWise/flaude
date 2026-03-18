@@ -2343,7 +2343,7 @@ ${hasBash ? `
             {gwsStatus === "install_failed" && (
               <div className="mt-2 space-y-2">
                 <p className="text-xs text-[#6B7280]">{lang === "ko" ? "터미널에서 직접 설치해주세요:" : "Install manually in terminal:"}</p>
-                <code className="block text-xs bg-gray-100 p-2 rounded">npm install -g @anthropic-ai/googleworkspace-tools</code>
+                <code className="block text-xs bg-gray-100 p-2 rounded">npm install -g @googleworkspace/cli</code>
                 <button onClick={() => setGwsStatus("checking")} className="w-full py-2 px-4 rounded-lg border border-gray-200 text-sm hover:bg-gray-50 transition-colors">
                   {lang === "ko" ? "다시 확인" : "Re-check"}
                 </button>
