@@ -321,10 +321,19 @@ function App() {
     }
   };
 
-  // Auto-connect on app start if already logged in
+  // Auto-connect on app start if already logged in, verify token first
   useEffect(() => {
     if (isLoggedIn) {
-      connectWebSocket();
+      // Verify token is still valid by calling /me
+      getMe()
+        .then(() => connectWebSocket())
+        .catch(() => {
+          // Token invalid — force re-login
+          setAuthToken(null);
+          setAuthUser(null);
+          localStorage.removeItem("flaude_user");
+          setIsLoggedIn(false);
+        });
     }
   }, [isLoggedIn]);
 
